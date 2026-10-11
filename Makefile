@@ -16,7 +16,7 @@ OBJCOPY := $(CROSS)objcopy
 OBJDUMP := $(CROSS)objdump
 
 CFLAGS  := -march=armv7-a -marm -ffreestanding -nostdlib -nostartfiles \
-	   -Wall -Wextra -O2 -g -Iinclude -Idrivers
+	   -Wall -Wextra -O2 -g -fno-stack-protector -Iinclude -Idrivers
 LDFLAGS := -static -nostdlib -Wl,--build-id=none
 
 BUILD  := build
@@ -26,7 +26,9 @@ TARGET := justiceBL
 OBJS := $(BUILD)/start.o \
 	$(BUILD)/main.o \
 	$(BUILD)/drivers/uart.o \
-	$(BUILD)/drivers/led.o
+	$(BUILD)/drivers/led.o \
+	$(BUILD)/drivers/mmc.o \
+	$(BUILD)/lib/crc32.o
 
 UBOOT_IMX ?= $(SDKROOT)/output/uboot/u-boot-dtb.imx
 

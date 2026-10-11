@@ -12,9 +12,16 @@
 镜像是什么代码，只认 IVT/BootData/DCD 结构；justiceBL 占据该位置，运行后从
 普通分区读出 `u-boot-dtb.bin` 加载到 0x87800000 并跳转。等价于手写一个迷你 SPL。
 
-## 当前状态（v0.4：模块化重构完成）
+## 当前状态（v0.5：SD/eMMC 驱动 + 自读校验）
 
 **代码原则见 `docs/CODING_STYLE.md`**：分模块、kernel 风格命名与排版、工程化构建。
+新增模块须先读 RM 对应章节 + 参考项目再下手（AGENTS.md 规矩）。
+
+v0.5：`drivers/mmc.[ch]`（USDHC 主机 + SD/eMMC 识别 + 逐块读，1 位总线
+400kHz PIO 保守实现，全路径有界等待）+ `lib/crc32.c`。main 去 LED/延时心跳，
+串口为唯一状态通道：上电识别 TF 卡 → 从 LBA2 读回自身镜像与 RAM 副本逐字节
+比对 + CRC32 → 识别 eMMC 并验证 LBA2 的 U-Boot IVT 标签 → 总结后 wfi。
+读取接口带逐块进度回调（`progress(done, total)`）。
 
 ```
 justiceBL/
