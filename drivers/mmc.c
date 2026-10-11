@@ -282,12 +282,12 @@ int sd_init(struct mmc_card *card)
 			       XFERTYP_CICEN, 0, &r);
 		ret = usdhc_send_cmd(base, 41, 0x40FF8000,
 				     XFERTYP_RSPTYP_48, 0, &r);
-		if (!ret && (r & BIT(31))) {
-			break;
+		if (ret) {
+			return -3;		/* 命令无响应：无卡/线路问题，秒退 */
 		}
-	}
-	if (i == 1000) {
-		return -3;
+		if (r & BIT(31)) {
+			break;			/* 就绪 */
+		}
 	}
 	card->csd_raw[0] = r;	/* 暂存 OCR（调试打印用）*/
 
@@ -337,12 +337,12 @@ int emmc_init(struct mmc_card *card)
 	for (i = 0; i < 1000; i++) {
 		ret = usdhc_send_cmd(base, 1, 0x40FF8000,
 				     XFERTYP_RSPTYP_48, 0, &r);
-		if (!ret && (r & BIT(31))) {
+		if (ret) {
+			return -2;		/* 命令无响应：秒退，不再长等 */
+		}
+		if (r & BIT(31)) {
 			break;
 		}
-	}
-	if (i == 1000) {
-		return -2;
 	}
 
 	usdhc_send_cmd(base, 2, 0, XFERTYP_RSPTYP_136 | XFERTYP_CCCEN,

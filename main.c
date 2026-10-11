@@ -111,7 +111,7 @@ static void self_read_verify(void)
 		report("SD identify", -1);
 		return;
 	}
-	uart_puts("SD ready, RCA=0x");
+	uart_puts("SD ready, RCA=");
 	uart_puthex(sd.rca);
 	uart_puts("\nread back self-image: ");
 
@@ -122,7 +122,7 @@ static void self_read_verify(void)
 	uart_puts(" done\n");
 
 	crc = crc32(READ_BUF, image_len);
-	uart_puts("CRC32(card) = 0x");
+	uart_puts("CRC32(card) = ");
 	uart_puthex(crc);
 	uart_puts("  vs RAM copy: ");
 	if (block_eq(READ_BUF, (const u8 *)IMAGE_BASE, image_len)) {
@@ -158,7 +158,7 @@ static void emmc_probe(void)
 		report("eMMC identify", -1);
 		return;
 	}
-	uart_puts("eMMC ready, RCA=0x");
+	uart_puts("eMMC ready, RCA=");
 	uart_puthex(emmc.rca);
 	uart_puts("\neMMC LBA2: ");
 
