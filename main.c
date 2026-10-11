@@ -56,6 +56,42 @@ static int block_eq(const u8 *a, const u8 *b, u32 len)
 	return 1;
 }
 
+static void hexdump_line(const u8 *p, u32 n)
+{
+	static const char hex[] = "0123456789abcdef";
+
+	for (u32 i = 0; i < n; i++) {
+		uart_putc(hex[p[i] >> 4]);
+		uart_putc(hex[p[i] & 0xf]);
+		uart_putc(' ');
+	}
+	uart_putc('\n');
+}
+
+/** 卡侧数据经 32 位字节交换后是否与 RAM 一致（端序诊断）*/
+static int match_swab32(const u8 *card, const u8 *ram, u32 len)
+{
+	for (u32 i = 0; i + 4 <= len; i += 4) {
+		if (card[i] != ram[i + 3] || card[i + 1] != ram[i + 2] ||
+		    card[i + 2] != ram[i + 1] || card[i + 3] != ram[i]) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/** 卡侧数据经 16 位半字交换后是否与 RAM 一致（端序诊断）*/
+static int match_swap16(const u8 *card, const u8 *ram, u32 len)
+{
+	for (u32 i = 0; i + 4 <= len; i += 4) {
+		if (card[i] != ram[i + 2] || card[i + 1] != ram[i + 3] ||
+		    card[i + 2] != ram[i] || card[i + 3] != ram[i + 1]) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
 static void self_read_verify(void)
 {
 	struct mmc_card sd;
@@ -91,8 +127,26 @@ static void self_read_verify(void)
 	uart_puts("  vs RAM copy: ");
 	if (block_eq(READ_BUF, (const u8 *)IMAGE_BASE, image_len)) {
 		uart_puts("MATCH\n");
+		return;
+	}
+	uart_puts("MISMATCH!\n");
+	uart_puts("card[0..31] : ");
+	hexdump_line(READ_BUF, 32);
+	uart_puts("ram [0..31] : ");
+	hexdump_line((const u8 *)IMAGE_BASE, 32);
+	if (match_swab32(READ_BUF, (const u8 *)IMAGE_BASE, image_len)) {
+		uart_puts("=> full match under 32-bit byteswap (PROT_CTRL EMODE)\n");
+	} else if (match_swap16(READ_BUF, (const u8 *)IMAGE_BASE, image_len)) {
+		uart_puts("=> full match under 16-bit halfword swap (PROT_CTRL EMODE)\n");
 	} else {
-		uart_puts("MISMATCH!\n");
+		uart_puts("=> not an endian transform; first diff: ");
+		for (u32 i = 0; i < image_len; i++) {
+			if (READ_BUF[i] != ((const u8 *)IMAGE_BASE)[i]) {
+				uart_puthex(i);
+				uart_puts("\n");
+				break;
+			}
+		}
 	}
 }
 
