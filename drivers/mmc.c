@@ -230,8 +230,10 @@ static int usdhc_read_data_port(u32 base, void *buf)
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BRR)) {
 		return -1;
 	}
+	/* 数据端口是大端语义（板上实测 v0.5 MISMATCH → swab32 全匹配确诊），
+	 * ARM 小端内存需在驱动边界归一化；将来写路径同样要 bswap */
 	for (u32 i = 0; i < MMC_BLOCK_SIZE / 4; i++) {
-		w[i] = readl(base + USDHC_DAT_PORT_OFF);
+		w[i] = __builtin_bswap32(readl(base + USDHC_DAT_PORT_OFF));
 	}
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
 		return -2;
