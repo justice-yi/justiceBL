@@ -18,6 +18,7 @@
 #include <imx6ull.h>
 #include <mmc.h>
 #include <stddef.h>
+#include <blocksrc.h>
 
 /* ---- USDHC 寄存器偏移（USDHC_Type）---- */
 #define USDHC_DS_ADDR_OFF	0x00
@@ -31,6 +32,12 @@
 #define USDHC_SYS_CTRL_OFF	0x2C
 #define USDHC_INT_STATUS_OFF	0x30
 #define USDHC_INT_EN_OFF	0x34
+#define USDHC_SIG_EN_OFF	0x38
+
+/* INT_STATUS_EN：bit0-5 正常事件(CC/TC/BGE/DINT/BWR/BRR)，bit16-22 错误事件
+ * (CTOE/CCE/CEBE/CIE/DTOE/DCE/DEBE)——错误位必须开，轮询判错才成立 */
+#define IRQEN_NORMAL		0x0000003FU
+#define IRQEN_ERRORS		0x007F0000U
 #define USDHC_HOST_CAP_OFF	0x40
 #define USDHC_MIX_CTRL_OFF	0x48
 #define USDHC_VEND_SPEC_OFF	0xC0
@@ -126,33 +133,68 @@ static int usdhc_wait_set(u32 base, u32 off, u32 mask)
 	return 1;
 }
 
+/* 无 libgcc 的 32 位无符号除法（移位减法，内核 do_div 同思路）：
+ * 裸机 -nostdlib 下 gcc 的 '/' 会引入 __aeabi_uidiv（libgcc），而该库的
+ * 除零路径又依赖 raise()——自带实现一刀两断。d=0 无定义，调用方保证非零 */
+static u32 udiv32(u32 n, u32 d)
+{
+	u32 q = 0;
+	u32 bit = 1;
+
+	while ((d < n) && !(d & 0x80000000U)) {
+		d <<= 1;
+		bit <<= 1;
+	}
+	while (bit) {
+		if (n >= d) {
+			n -= d;
+			q |= bit;
+		}
+		d >>= 1;
+		bit >>= 1;
+	}
+	return q;
+}
+
 /**
  * usdhc_set_clock() - 把 SD 时钟设到 <=target（就近选取分频）
  *
  * 基准时钟从 HOST_CAP 寄存器运行时读出（SDHCI 惯例，免 CCM 逆推），
  * 分频 sd_clk = base / ((DVS+1) * (2*SDCLKFS))。
  */
+/* 基准时钟运行时计算，算法对齐 kernel clk-imx6ul.c:39,248-249,299-300：
+ *   usdhc root = PLL2 PFD（CSCMR1 bit16/17 mux：0=pll2_pfd2 396M, 1=pll2_pfd0 352M）
+ *              ÷ podf（CSCDR1：usdhc1 bit11、usdhc2 bit16，3 位 ÷1~8）
+ * 注意：HOST_CAP[15:8] 在 i.MX 上是 retuning 能力位而非 SDHCI 标准的
+ * base-clock 字段，不可用于读频率（v0.5.2 曾误读）。 */
+static u32 usdhc_base_clock_mhz(u32 base)
+{
+	u32 is_usdhc1 = (base == USDHC1_BASE);
+	u32 sel = (readl(MX6ULL_CCM_BASE + 0x1C) >>
+		   (is_usdhc1 ? 16 : 17)) & 1;
+	u32 podf = ((readl(MX6ULL_CCM_BASE + 0x24) >>
+		     (is_usdhc1 ? 11 : 16)) & 7) + 1;
+
+	return udiv32(sel ? 352 : 396, podf);
+}
+
 static void usdhc_set_clock(u32 base, u32 target_hz)
 {
-	u32 base_mhz = (readl(base + USDHC_HOST_CAP_OFF) >> 8) & 0xFF;
+	u32 base_mhz = usdhc_base_clock_mhz(base);
 	u32 sys = readl(base + USDHC_SYS_CTRL_OFF) & ~0x0000FFF0U;
 	u32 dvs, fs;
-
-	if (!base_mhz) {
-		base_mhz = 24;		/* 兜底假设 24MHz */
-	}
-	for (dvs = 15; ; dvs--) {
-		for (fs = 256; fs >= 1; fs--) {
-			if ((base_mhz * 1000000U) /
-			    ((dvs + 1) * 2 * fs) <= target_hz) {
+	/* 从最小分频向大搜索：首个 <=target 的组合即"不超目标的最大频率"。
+	 * （v0.5 曾从最大分频端搜索，恒命中 Base/8192≈24kHz，比最优慢 16 倍）*/
+	for (dvs = 0; dvs <= 15; dvs++) {
+		for (fs = 1; fs <= 256; fs++) {
+			if (udiv32(base_mhz * 1000000U,
+				 (dvs + 1) * 2 * fs) <= target_hz) {
 				goto found;
 			}
 		}
-		if (!dvs) {
-			fs = 1;
-			goto found;
-		}
 	}
+	dvs = 15;			/* 兜底（Base 低到无解时取最小频率）*/
+	fs = 256;
 found:
 	writel(sys | (fs << 8) | (dvs << 4), base + USDHC_SYS_CTRL_OFF);
 }
@@ -181,9 +223,11 @@ static int usdhc_hw_init(u32 base)
 		return -1;
 	}
 
-	writel(0x0000803F, base + USDHC_INT_EN_OFF);	/* 状态使能，信号门全关（轮询）*/
-	writel(0xFFFFFFFF, base + USDHC_INT_STATUS_OFF);/* 写 1 清历史 */
-	writel((1 << 16) | 64, base + USDHC_BLK_ATT_OFF);/* 块大小 512，count 占位 */
+	/* 状态使能开正常+错误事件；信号使能显式清 0（不依赖复位默认）——纯轮询 */
+	writel(IRQEN_NORMAL | IRQEN_ERRORS, base + USDHC_INT_EN_OFF);
+	writel(0, base + USDHC_SIG_EN_OFF);
+	writel(0xFFFFFFFF, base + USDHC_INT_STATUS_OFF);/* 写 1 清中断状态历史 */
+	writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);/* 块长 512，count 占位 */
 	writel(0x00000008, base + USDHC_PROT_CTRL_OFF);	/* 1 位总线 + 大端数据口 */
 	usdhc_set_clock(base, 400000);
 	return 0;
@@ -247,6 +291,44 @@ static int usdhc_read_data_port(u32 base, void *buf)
 }
 
 /* ---- 卡识别层 ---- */
+
+/*
+ * 本驱动使用的命令一览（SD 物理/eMMC 规范，与 RM 58.6 命令表同源）
+ *
+ * 命令   名称                  arg            响应      目的
+ * ------ --------------------- -------------- --------- -------------------------
+ * CMD0   GO_IDLE_STATE         0              无        软复位卡 -> Idle 态
+ * CMD1   SEND_OP_COND          0x40FF8000     R3        eMMC 电压协商/等卡就绪
+ * CMD8   SEND_IF_COND          0x1AA          R7        SD2.0 握手(回显图案 0xAA)
+ * CMD55  APP_CMD               0              R1        应用命令前缀(下一句按
+ *                                                         ACMD 解释)
+ * ACMD41 SD_SEND_OP_COND       0x40FF8000     R3        SD 电压协商/等卡就绪
+ * CMD2   ALL_SEND_CID          0              R2        收卡"身份证" -> Ident 态
+ * CMD3   SEND/SET_REL_ADDR     SD:0/MMC:RCA   R6/R1     定址 RCA -> Standby 态
+ * CMD9   SEND_CSD              RCA<<16        R2        收卡参数页(容量/时序)
+ * CMD7   SELECT_CARD           RCA<<16        R1b       点名选中 -> Transfer 态
+ *                                                         (此后数据命令才合法)
+ * CMD17  READ_SINGLE_BLOCK     LBA            R1+数据   读一块(512B+CRC16)
+ *
+ * 参数位分解：
+ *   CMD8   arg = [12:8] VHS=0x1 (2.7~3.6V) | [7:0] 图案 0xAA，R7 原样回显，
+ *          回显不符 = SD1.x 老卡(不支持块寻址)，拒绝服务
+ *   ACMD41/CMD1 arg = [30] HCS=1 (主机支持大容量) | [23:15] Vdd 窗 2.7~3.6V
+ *          R3 返回 = [31] busy(上电中=0，就绪=1，轮询它) | [30] 卡容量 |
+ *                    [23:0] 卡电压窗
+ *   CMD3   SD：卡自选号，R6 响应 [31:16] 即新 RCA -> r & 0xFFFF0000
+ *          eMMC：主机出号，arg = RCA(=1) << 16，R1 响应
+ *   CMD17  arg = 块号(块寻址)。敢直接填 LBA 的前提 = CMD8 握手通过 + HCS=1；
+ *          老 SDSC 卡此处应为字节地址，本驱动不支持(识别阶段已筛除)
+ *
+ * 响应类型 -> XFERTYP 位选择（规范决定，不是随手配）：
+ *   R1/R6/R7 = RSPTYP_48  | CCCEN | CICEN  48 位：CRC7 + 命令号回显
+ *   R1b      = RSPTYP_48_BUSY                  R1 + 卡拉 DAT0 示忙，硬件盯线
+ *   R2       = RSPTYP_136 | CCCEN              136 位 CID/CSD：有 CRC、无命令号
+ *   R3       = RSPTYP_48 (裸)                  OCR：规范规定无 CRC、无命令号
+ *                                             回显——误开校验位会永远报错
+ */
+
 
 static void sd_cmd0(u32 base)
 {
@@ -401,3 +483,42 @@ int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
 	}
 	return 0;
 }
+
+/* ---- 通用块源实例：把卡协议驱动适配成 block_source 接口 ---- */
+
+static struct mmc_card sd_card;
+static struct mmc_card emmc_card;
+
+static int sd_source_init(void)
+{
+	return sd_init(&sd_card);
+}
+
+static int sd_source_read(u32 lba, u32 nblocks, void *buf,
+			  void (*progress)(u32 done, u32 total))
+{
+	return mmc_read_blocks(&sd_card, lba, nblocks, buf, progress);
+}
+
+const struct block_source sd_source = {
+	.name = "SD (USDHC1)",
+	.init = sd_source_init,
+	.read = sd_source_read,
+};
+
+static int emmc_source_init(void)
+{
+	return emmc_init(&emmc_card);
+}
+
+static int emmc_source_read(u32 lba, u32 nblocks, void *buf,
+			    void (*progress)(u32 done, u32 total))
+{
+	return mmc_read_blocks(&emmc_card, lba, nblocks, buf, progress);
+}
+
+const struct block_source emmc_source = {
+	.name = "eMMC (USDHC2)",
+	.init = emmc_source_init,
+	.read = emmc_source_read,
+};
