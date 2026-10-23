@@ -13,6 +13,7 @@
 #define MX6ULL_GPIO1_BASE	0x0209C000
 #define MX6ULL_CCM_BASE		0x020C4000
 #define MX6ULL_IOMUXC_BASE	0x020E0000
+#define MX6ULL_SRC_BASE		0x020D8000	/* sbmr1=+0x04, imx-regs.h:523 */
 
 static inline void writel(u32 val, u32 addr)
 {
