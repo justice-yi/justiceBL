@@ -48,6 +48,20 @@ reset:
 	mov	r0, #0
 	mcr	p15, 0, r0, c7, c5, 0	@ 使整个 I-cache 失效（关≠空）
 
+	/* 3b. 使能 FPU/NEON 协处理器访问（CPACR CP10/CP11 全权）。
+	      复位默认禁用，而 gcc 会把 u64 局部分配到 VFP 寄存器（板上
+	      实锤：timelog_dump 序言 vpush {d8} 直接触发未定义指令异常
+	      落进 hang——v0.10 卡 timeline 前的根因）。U-Boot/内核同款 */
+	mrc	p15, 0, r0, c1, c0, 2
+	orr	r0, r0, #(0xF << 20)
+	mcr	p15, 0, r0, c1, c0, 2
+	isb
+	/* 3c. VFP 第二重使能：FPEXC.EN（引擎总开关）。CPACR 只是访问权，
+	      EN=0 时 VFP 指令仍触发未定义异常（v0.10.1 板上实锤：只开
+	      CPACR 依旧卡 vpush）。Linux 靠 trap 惰性使能，裸机直接开 */
+	mov	r0, #(1 << 30)
+	vmsr	fpexc, r0
+
 	/* 4. 设栈：SP 指向链接脚本保留的栈区顶端，向下生长 */
 	ldr	sp, =_stack_top
 
