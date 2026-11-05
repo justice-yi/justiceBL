@@ -3,21 +3,29 @@
  * justiceBL SD/MMC 子系统 —— USDHC 主机驱动 + SD/eMMC 卡识别。
  *
  * 依据（按项目规矩先读手册与参考后下手）：
- *   - RM uSDHC 章节；寄存器布局与 MCIMX6Y2.h 的 USDHC_Type 一致
- *   - U-Boot drivers/mmc/fsl_esdhc_imx.c/.h（XFERTYP 高 16 位照常、低 7 位
- *     数据 mode 位写 MIX_CTRL；VENDORSPEC_INIT=0x20007809；IRQ/BRR 等位值）
+ *   - RM uSDHC 章节（58 章）：两段分频公式（图 58-14：card_clk =
+ *     Base/(DVS+1)/SDCLKFS_DIV，后一档 2 的幂）、时钟切换先停 CKEN
+ *     等 SDSTB（"Before changing clock divisor value...make sure the
+ *     SDSTB bit is high"）；寄存器布局与 MCIMX6Y2.h 的 USDHC_Type 一致
+ *   - U-Boot drivers/mmc/fsl_esdhc_imx.c + include/fsl_esdhc_imx.h：补 RM
+ *     两处空白——VENDORSPEC 位表（RM 只提 VSELECT，CKEN=bit14 等无位表）、
+ *     DTW 编码（RM 表格为图无法文本提取；DTW[2:1] 01=4bit）；另 XFERTYP/
+ *     MIX_CTRL 用法、CMD6/ACMD6 切换时序（规范层，RM 不覆盖）
  *   - 第三方参考 imx6ull_NoosProgramProject/14_TF卡编程（CMD 标志位编码交叉验证）
- *   - 引脚/门控：kernel dts imx6ull-alientek-emmc.dts:633,666（pad 值）、
- *     imx6ul-pinfunc.h（偏移）、clk-imx6ul.c:446（CCGR6 bit2=usdhc1, bit4=usdhc2）
+ *   - 引脚/门控：kernel dts imx6ull-alientek-emmc.dts:633,666（pad 值，
+ *     内核跑 50MHz+ 同值）、imx6ul-pinfunc.h（偏移）、clk-imx6ul.c:446
  *
- * 刻意的保守取舍（提速是后续课题）：1 位总线、400kHz、逐块 CMD17 PIO。
+ * 保守取舍：识别后切 4 位 + High Speed（49.5MHz，v0.12 前为 1 位 400kHz，
+ * 600KB 要 12.8s）；仍逐块 CMD17 PIO——CMD18 多块读 + 省命令开销是后续课题。
  * 所有等待均有界——本项目铁律：任何路径都不许死循环。
  */
 
 #include <types.h>
 #include <imx6ull.h>
 #include <mmc.h>
+#include <math.h>
 #include <stddef.h>
+#include <printf.h>
 #include <blocksrc.h>
 
 /* ---- USDHC 寄存器偏移（USDHC_Type）---- */
@@ -53,6 +61,10 @@
 #define SYSCTL_RSTC		BIT(25)
 #define SYSCTL_RSTD		BIT(26)
 #define SYSCTL_INITA		BIT(27)
+#define PRSSTAT_SDSTB		BIT(3)		/* RM：改分频前必须等到它为 1 */
+#define VENDORSPEC_CKEN		0x00004000U	/* RM 未给位表，值自 U-Boot 头 */
+#define PROT_CTRL_DTW_MASK	0x00000006U	/* DTW[2:1]（编码同上 U-Boot）*/
+#define PROT_CTRL_DTW_4BIT	0x00000002U
 #define VENDORSPEC_INIT		0x20007809U
 #define VENDORSPEC_HCKEN	0x00001000U
 #define VENDORSPEC_IPGEN	0x00000800U
@@ -133,35 +145,8 @@ static int usdhc_wait_set(u32 base, u32 off, u32 mask)
 	return 1;
 }
 
-/* 无 libgcc 的 32 位无符号除法（移位减法，内核 do_div 同思路）：
- * 裸机 -nostdlib 下 gcc 的 '/' 会引入 __aeabi_uidiv（libgcc），而该库的
- * 除零路径又依赖 raise()——自带实现一刀两断。d=0 无定义，调用方保证非零 */
-static u32 udiv32(u32 n, u32 d)
-{
-	u32 q = 0;
-	u32 bit = 1;
+/* 无 libgcc 的除法已抽到 lib/math.c（udiv32/udiv64_mod），此处引用 */
 
-	while ((d < n) && !(d & 0x80000000U)) {
-		d <<= 1;
-		bit <<= 1;
-	}
-	while (bit) {
-		if (n >= d) {
-			n -= d;
-			q |= bit;
-		}
-		d >>= 1;
-		bit >>= 1;
-	}
-	return q;
-}
-
-/**
- * usdhc_set_clock() - 把 SD 时钟设到 <=target（就近选取分频）
- *
- * 基准时钟从 HOST_CAP 寄存器运行时读出（SDHCI 惯例，免 CCM 逆推），
- * 分频 sd_clk = base / ((DVS+1) * (2*SDCLKFS))。
- */
 /* 基准时钟运行时计算，算法对齐 kernel clk-imx6ul.c:39,248-249,299-300：
  *   usdhc root = PLL2 PFD（CSCMR1 bit16/17 mux：0=pll2_pfd2 396M, 1=pll2_pfd0 352M）
  *              ÷ podf（CSCDR1：usdhc1 bit11、usdhc2 bit16，3 位 ÷1~8）
@@ -178,25 +163,45 @@ static u32 usdhc_base_clock_mhz(u32 base)
 	return udiv32(sel ? 352 : 396, podf);
 }
 
-static void usdhc_set_clock(u32 base, u32 target_hz)
+/**
+ * usdhc_set_clock() - SD 时钟切到 <=target 的最大可达档；返回实际频率
+ *
+ * 两段分频（RM 图 58-14）：card_clk = Base / (DVS+1) / SDCLKFS_DIV，
+ * SDCLKFS_DIV 只有 2 的幂档（1,2,...,256）——比 v0.11 前的任意整数 fs
+ * 更保守，也贴合 RM 文字"by (1*), 2, 4, ..., 256"。字段编码 = 档位/2。
+ * 切换时序（RM SDSTB 描述 + U-Boot set_sysctl 同款实证）：
+ * 停卡钟（VENDORSPEC.CKEN）→ 写分频 → 等 SDSTB=1 → 复开卡钟。
+ *
+ * Return: 实际 Hz（<0 = SDSTB 等待超时）
+ */
+static int usdhc_set_clock(u32 base, u32 target_hz)
 {
-	u32 base_mhz = usdhc_base_clock_mhz(base);
-	u32 sys = readl(base + USDHC_SYS_CTRL_OFF) & ~0x0000FFF0U;
-	u32 dvs, fs;
-	/* 从最小分频向大搜索：首个 <=target 的组合即"不超目标的最大频率"。
+	u32 base_hz = usdhc_base_clock_mhz(base) * 1000000U;
+	u32 dvs, fs, fsdiv;
+
+	/* 从最小分频向大搜：首个 <=target 的组合即"不超目标的最大频率"。
 	 * （v0.5 曾从最大分频端搜索，恒命中 Base/8192≈24kHz，比最优慢 16 倍）*/
 	for (dvs = 0; dvs <= 15; dvs++) {
-		for (fs = 1; fs <= 256; fs++) {
-			if (udiv32(base_mhz * 1000000U,
-				 (dvs + 1) * 2 * fs) <= target_hz) {
+		for (fsdiv = 1; fsdiv <= 256; fsdiv <<= 1) {
+			if (udiv32(base_hz, (dvs + 1) * fsdiv) <= target_hz) {
 				goto found;
 			}
 		}
 	}
 	dvs = 15;			/* 兜底（Base 低到无解时取最小频率）*/
-	fs = 256;
+	fsdiv = 256;
 found:
-	writel(sys | (fs << 8) | (dvs << 4), base + USDHC_SYS_CTRL_OFF);
+	fs = fsdiv >> 1;		/* 字段值 = 档位/2，0 即 ÷1 */
+	writel(readl(base + USDHC_VEND_SPEC_OFF) & ~VENDORSPEC_CKEN,
+	       base + USDHC_VEND_SPEC_OFF);
+	writel((readl(base + USDHC_SYS_CTRL_OFF) & ~0x0000FFF0U) |
+	       (fs << 8) | (dvs << 4), base + USDHC_SYS_CTRL_OFF);
+	if (!usdhc_wait_set(base, USDHC_PRES_STATE_OFF, PRSSTAT_SDSTB)) {
+		return -1;
+	}
+	writel(readl(base + USDHC_VEND_SPEC_OFF) | VENDORSPEC_CKEN,
+	       base + USDHC_VEND_SPEC_OFF);
+	return (int)udiv32(base_hz, (dvs + 1) * fsdiv);
 }
 
 /** 主机复位 + 通用初始化（U-Boot fsl_esdhc_init 同套路）*/
@@ -229,7 +234,9 @@ static int usdhc_hw_init(u32 base)
 	writel(0xFFFFFFFF, base + USDHC_INT_STATUS_OFF);/* 写 1 清中断状态历史 */
 	writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);/* 块长 512，count 占位 */
 	writel(0x00000008, base + USDHC_PROT_CTRL_OFF);	/* 1 位总线 + 大端数据口 */
-	usdhc_set_clock(base, 400000);
+	if (usdhc_set_clock(base, 400000) < 0) {
+		return -2;
+	}
 	return 0;
 }
 
@@ -266,17 +273,15 @@ static int usdhc_send_cmd(u32 base, u8 idx, u32 arg, u32 xfr_hi, u32 mix_lo,
 	return 0;
 }
 
-/** 收一块数据到 buf（512B，PIO 经数据口，BRR 轮询）*/
-static int usdhc_read_data_port(u32 base, void *buf)
+/** 从数据口收 nwords 个字到 buf（PIO，BRR 轮询；块长/块数由调用方设）*/
+static int usdhc_read_data_port(u32 base, u32 *w, u32 nwords)
 {
-	u32 *w = buf;
-
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BRR)) {
 		return -1;
 	}
 	/* 数据端口是大端语义（板上实测 v0.5 MISMATCH → swab32 全匹配确诊），
 	 * ARM 小端内存需在驱动边界归一化；将来写路径同样要 bswap */
-	for (u32 i = 0; i < MMC_BLOCK_SIZE / 4; i++) {
+	for (u32 i = 0; i < nwords; i++) {
 		w[i] = __builtin_bswap32(readl(base + USDHC_DAT_PORT_OFF));
 	}
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
@@ -335,6 +340,109 @@ static void sd_cmd0(u32 base)
 	usdhc_send_cmd(base, 0, 0, 0, 0, NULL);
 }
 
+/* ---- 提速：4 位总线 + High Speed（v0.12）----
+ * 时序属 SD/eMMC 规范层（RM 58.6 只给命令定义不给用法），对齐
+ * U-Boot mmc core：先宽度（ACMD6 / CMD6 写 BUS_WIDTH），再时钟到
+ * Default Speed 档（SD 25M / eMMC 26M），最后切 High Speed 提到 50M。
+ * HS 切换失败降级留在 DS 继续启动（600KB 也就 ~250ms）；宽度和
+ * DS 提速失败 = 卡或链路异常，返回错误由上层报停。*/
+#define CLK_DS_HZ	25000000U	/* Default Speed 档上限 */
+#define CLK_HS_HZ	50000000U	/* High Speed（就近分频 49.5M）*/
+
+/**
+ * sd_speed_up() - SD 卡：1 位 400kHz -> 4 位 50MHz High Speed
+ * @rca: CMD3 拿到的卡相对地址（ACMD55 前缀要带它）
+ *
+ * SD 的 CMD6(SWITCH) 除 R1 外还在数据线回 64 字节状态——必须按
+ * 单块 64B 数据读收掉，否则卡驱动数据线、下一条命令报错。
+ */
+static int sd_speed_up(u32 base, u32 rca)
+{
+	u32 status[16];			/* CMD6 返回 64B 状态，只验 R1 不解析 */
+	u32 r;
+	int ret, hz;
+
+	ret = usdhc_send_cmd(base, 55, rca,
+			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN | XFERTYP_CICEN,
+			     0, &r);
+	if (!ret) {
+		ret = usdhc_send_cmd(base, 6, 2,		/* ACMD6: 4 位 */
+				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+				     XFERTYP_CICEN, 0, &r);
+	}
+	if (ret) {
+		return -1;		/* 4 位是 SD 卡强制能力，失败即异常 */
+	}
+	writel((readl(base + USDHC_PROT_CTRL_OFF) & ~PROT_CTRL_DTW_MASK) |
+	       PROT_CTRL_DTW_4BIT, base + USDHC_PROT_CTRL_OFF);
+
+	hz = usdhc_set_clock(base, CLK_DS_HZ);
+	if (hz < 0) {
+		return -2;
+	}
+
+	/* CMD6 mode switch：arg=0x80|保留组 0xF|group1 选 1(High Speed)，
+	 * R1 bit7 = switch error（SD 规范 CARD_STATUS 的 SWITCH_ERROR）*/
+	writel((1 << 16) | 64, base + USDHC_BLK_ATT_OFF);
+	ret = usdhc_send_cmd(base, 6, 0x80FFFFF1U,
+			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN | XFERTYP_CICEN |
+			     XFERTYP_DPSEL,
+			     MIX_CTRL_BCEN | MIX_CTRL_DTDSEL_READ, &r);
+	if (ret || (r & BIT(7)) ||
+	    usdhc_read_data_port(base, status, 64 / 4)) {
+		printf("sd: HS switch failed, stay at DS\n");
+		return 0;
+	}
+
+	hz = usdhc_set_clock(base, CLK_HS_HZ);
+	if (hz < 0) {
+		return -3;
+	}
+	printf("sd: 4-bit, %u kHz\n", (u32)hz / 1000);
+	return 0;
+}
+
+/**
+ * emmc_speed_up() - eMMC：1 位 400kHz -> 4 位 52MHz High Speed
+ *
+ * eMMC 的 CMD6 是 byte-mode 写 EXT_CSD（无数据相位）：
+ * arg = 0x03<<24 | 索引<<16 | 值<<8，响应 R1b。
+ */
+static int emmc_speed_up(u32 base)
+{
+	u32 r;
+	int ret, hz;
+
+	/* EXT_CSD[183] BUS_WIDTH = 1（4 位）*/
+	ret = usdhc_send_cmd(base, 6, 0x03B70100U, XFERTYP_RSPTYP_48_BUSY,
+			     0, &r);
+	if (ret) {
+		return -1;
+	}
+	writel((readl(base + USDHC_PROT_CTRL_OFF) & ~PROT_CTRL_DTW_MASK) |
+	       PROT_CTRL_DTW_4BIT, base + USDHC_PROT_CTRL_OFF);
+
+	hz = usdhc_set_clock(base, CLK_DS_HZ);
+	if (hz < 0) {
+		return -2;
+	}
+
+	/* EXT_CSD[185] HS_TIMING = 1（High Speed）*/
+	ret = usdhc_send_cmd(base, 6, 0x03B90100U, XFERTYP_RSPTYP_48_BUSY,
+			     0, &r);
+	if (ret) {
+		printf("emmc: HS switch failed, stay at DS\n");
+		return 0;
+	}
+
+	hz = usdhc_set_clock(base, CLK_HS_HZ);
+	if (hz < 0) {
+		return -3;
+	}
+	printf("emmc: 4-bit, %u kHz\n", (u32)hz / 1000);
+	return 0;
+}
+
 /** SD 识别：CMD0 -> CMD8 -> ACMD41(轮询 busy) -> CMD2 -> CMD3 -> CMD9 -> CMD7 */
 int sd_init(struct mmc_card *card)
 {
@@ -357,14 +465,21 @@ int sd_init(struct mmc_card *card)
 		return -2;			/* 不是 SD2.0 卡或无卡 */
 	}
 
-	/* ACMD41 = CMD55 + ACMD41，忙位 OCR[31] 置 1 即就绪 */
+	/* ACMD41 = CMD55 + ACMD41，忙位 OCR[31] 置 1 即就绪。
+	 * 命令级错误（超时/CRC）= 无卡或线路问题，立即失败不空等 1000 轮 */
 	for (i = 0; i < 1000; i++) {
-		usdhc_send_cmd(base, 55, 0,
-			       XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
-			       XFERTYP_CICEN, 0, &r);
+		ret = usdhc_send_cmd(base, 55, 0,
+				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+				     XFERTYP_CICEN, 0, &r);
+		if (ret) {
+			return -3;
+		}
 		ret = usdhc_send_cmd(base, 41, 0x40FF8000,
 				     XFERTYP_RSPTYP_48, 0, &r);
-		if (!ret && (r & BIT(31))) {
+		if (ret) {
+			return -3;
+		}
+		if (r & BIT(31)) {
 			break;
 		}
 	}
@@ -396,6 +511,11 @@ int sd_init(struct mmc_card *card)
 		return -5;
 	}
 
+	ret = sd_speed_up(base, card->rca);
+	if (ret) {
+		return -6;
+	}
+
 	card->base = base;
 	card->is_emmc = 0;
 	return 0;
@@ -415,11 +535,15 @@ int emmc_init(struct mmc_card *card)
 
 	sd_cmd0(base);
 
-	/* CMD1：主机 OCR（含 bit30 大容量标志），忙位 OCR[31] 置 1 即就绪 */
+	/* CMD1：主机 OCR（含 bit30 大容量标志），忙位 OCR[31] 置 1 即就绪。
+	 * 命令级错误 = 无卡/线路问题，立即失败（不再空等 1000 轮）*/
 	for (i = 0; i < 1000; i++) {
 		ret = usdhc_send_cmd(base, 1, 0x40FF8000,
 				     XFERTYP_RSPTYP_48, 0, &r);
-		if (!ret && (r & BIT(31))) {
+		if (ret) {
+			return -2;
+		}
+		if (r & BIT(31)) {
 			break;
 		}
 	}
@@ -449,6 +573,11 @@ int emmc_init(struct mmc_card *card)
 		return -4;
 	}
 
+	ret = emmc_speed_up(base);
+	if (ret) {
+		return -5;
+	}
+
 	card->base = base;
 	card->is_emmc = 1;
 	return 0;
@@ -473,7 +602,7 @@ int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
 		if (ret) {
 			return -1;
 		}
-		if (usdhc_read_data_port(base, p)) {
+		if (usdhc_read_data_port(base, p, MMC_BLOCK_SIZE / 4)) {
 			return -2;
 		}
 		p += MMC_BLOCK_SIZE / 4;
