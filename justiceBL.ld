@@ -37,7 +37,17 @@ SECTIONS
 		__bss_end = .;
 	} > OCRAM
 
-	/* 栈：bss 之后保留 8KB，SP 从顶端向下生长 */
+	/* 时间线记录区（timer.c）：256 条 × 16B = 4KB，NOLOAD 不占镜像。
+	 * 容量改这里一处，模块按 __timelog_start/end 自动得出 */
+	.timelog (NOLOAD) :
+	{
+		. = ALIGN(8);		/* timelog_entry 含 u64，8 字节对齐 */
+		__timelog_start = .;
+		. += 4K;
+		__timelog_end = .;
+	} > OCRAM
+
+	/* 栈：bss+timelog 之后保留 8KB，SP 从顶端向下生长 */
 	. = ALIGN(8);
 	. += 8K;
 	_stack_top = .;

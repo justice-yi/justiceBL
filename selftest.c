@@ -17,8 +17,10 @@
 
 /* justiceBL 镜像在 RAM 的起点（= ROM 搬运后的 IVT 落点，mkimx HDR=0xC00 布局）*/
 #define IMAGE_BASE		0x00907400U
-/* 读回缓冲：栈顶之上、OCRAM 空闲区顶 0x00918000 之下（镜像 < ~44KB 时安全）*/
-#define READ_BUF		((u8 *)0x0090C000)
+/* 读回缓冲：栈顶（~0x0090D000，随镜像增长）之上、OCRAM 空闲区顶
+ * 0x00918000 之下——timelog 加入后布局见 justiceBL.ld；
+ * 镜像+bss+timelog+栈+读回内容须 < 0x00918000（当前镜像 ~10KB，富余）*/
+#define READ_BUF		((u8 *)0x0090E000)
 
 extern char __bss_start[];		/* 链接符号：文件镜像末端 */
 
@@ -82,6 +84,7 @@ static void selftest_others(const struct block_source *boot_src)
 		}
 		uart_puts("LBA2=");
 		uart_puthex(*(u32 *)blk);
+		uart_putc('\r');
 		uart_putc('\n');
 	}
 }

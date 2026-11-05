@@ -13,6 +13,8 @@
 #include <types.h>
 #include <stddef.h>
 #include <uart.h>
+#include <printf.h>
+#include <timer.h>
 #include <blocksrc.h>
 #include "boot.h"
 
@@ -41,9 +43,7 @@ static void stage2_jump(u32 entry)
 {
 	void (*fn)(void) = (void (*)(void))entry;
 
-	uart_puts("\nstage2: jumping to ");
-	uart_puthex(entry);
-	uart_puts("\n");
+	printf("\nstage2: jumping to 0x%08x\n", entry);
 	fn();
 }
 
@@ -51,43 +51,44 @@ void stage2_boot(const struct block_source *src)
 {
 	static u8 blk[512] __attribute__((aligned(4)));
 	u8 *dest = (u8 *)STAGE2_LOAD_ADDR;
+	record_time("read one block -");
 
 	/* 首块先验货：U-Boot 裸 bin 首指令是 ARM 分支（高字节 0xEA/0xE5），
 	 * 用它排除"该位置没有有效镜像"（空白/0xFF/错位）*/
+	 
 	if (src->read(STAGE2_LBA, 1, blk, NULL) ||
 	    (blk[3] != 0xEA && blk[3] != 0xE5)) {
-		uart_puts("stage2: no image at LBA ");
-		uart_puthex(STAGE2_LBA);
-		uart_puts(", halt\n");
+		printf("stage2: no image at LBA 0x%08x, halt\n", STAGE2_LBA);
 		for (;;) {
 			__asm__ volatile ("wfi");
 		}
 	}
-	uart_puts("stage2: load ");
-	uart_puthex(STAGE2_MAX_BLOCKS);
-	uart_puts(" blocks from LBA ");
-	uart_puthex(STAGE2_LBA);
-	uart_puts(" -> ");
-	uart_puthex(STAGE2_LOAD_ADDR);
-	uart_putc('\n');
-
+		
+	record_time("read one block +");
+	printf("stage2: load %u blocks from LBA 0x%08x -> 0x%08x\n",
+	       STAGE2_MAX_BLOCKS, STAGE2_LBA, STAGE2_LOAD_ADDR);
+	record_time("read uboot -");
 	for (u32 i = 0; i < STAGE2_MAX_BLOCKS; i++) {
 		if (i == 0) {			/* 首块已在手 */
+			record_time("memcpy one block -");
 			for (u32 j = 0; j < 512; j++) {
 				dest[j] = blk[j];
 			}
+			record_time("memcpy one block +");
 			progress_dot(1, STAGE2_MAX_BLOCKS);
 			continue;
 		}
 		if (src->read(STAGE2_LBA + i, 1, dest + i * 512,
 			      progress_dot)) {
-			uart_puts("\nstage2: read fail, halt\n");
+			printf("\nstage2: read fail, halt\n");
 			for (;;) {
 				__asm__ volatile ("wfi");
 			}
 		}
 	}
+	record_time("read uboot +");
 
-	uart_puts("\n");
+	printf("\n");
+	timelog_dump();
 	stage2_jump(STAGE2_ENTRY);
 }

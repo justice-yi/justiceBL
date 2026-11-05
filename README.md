@@ -32,6 +32,7 @@ justiceBL/
 │   ├── imx6ull.h        SoC 基址 + writel/readl（与内核同名同义）
 │   ├── uart.[ch]        UART1 驱动（115200 8N1 轮询，含超时诊断）
 │   └── led.[ch]         LED0 驱动（GPIO1_IO03 低亮）
+├── lib/                 通用例程（无 libc/libgcc 依赖）：crc32 / math（除法）/ printf
 ├── docs/CODING_STYLE.md 代码原则
 ├── justiceBL[|-ddr].ld  链接脚本（OCRAM 正式版 / DDR 对照版）
 ├── mkimx.py             打包器（IVT/BootData/DCD，指针字段小端！）
@@ -52,6 +53,7 @@ justiceBL/
 | UART1 波特率 | 0x02020090/0xA4/0xA8 | UFCR=(5<<7)，UBIR=71，UBMR=3124 → 115200 整 |
 | GPIO1 时钟 | CCM_CCGR1 0x020C406C | bit27:26=11 |
 | UART1 时钟 | CCM_CCGR5 0x020C407C | bit25:24=11 |
+| 时间线计数器 | SCTR 0x021DC000（CNTCR=+0x00，CNTFID0=+0x20） | CNTCR=FREQ0\|ENABLE\|HDBG；门控 CCGR5 bit3:2=11；计数固定 8MHz，读数走 CNTPCT（mrrc p15,0,c14） |
 
 波特率依赖复位默认时钟树（PLL3=480M → /6 = 80MHz 参考钟）；显式配时钟是第 4 级。
 
