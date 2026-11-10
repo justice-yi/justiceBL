@@ -53,6 +53,7 @@
 /* ---- 位定义（值与 U-Boot fsl_esdhc_imx.h 一致）---- */
 #define IRQSTAT_CC		BIT(0)
 #define IRQSTAT_TC		BIT(1)
+#define IRQSTAT_BWTEN		BIT(4)
 #define IRQSTAT_BRR		BIT(5)
 #define IRQSTAT_CTOE		BIT(16)
 #define IRQSTAT_CCE		BIT(17)
@@ -293,6 +294,51 @@ static int usdhc_read_data_port(u32 base, u32 *w, u32 nwords)
 	}
 	writel(IRQSTAT_TC | IRQSTAT_BRR, base + USDHC_INT_STATUS_OFF);
 	return 0;
+}
+
+/** 向数据口发 nwords 个字（PIO，BWTEN 轮询；块长/块数由调用方设）。
+ * 字节序与读路径同款：数据口大端语义，写入前 swab */
+static int usdhc_write_data_port(u32 base, const u32 *w, u32 nwords)
+{
+	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BWTEN)) {
+		return -1;
+	}
+	for (u32 i = 0; i < nwords; i++) {
+		writel(__builtin_bswap32(w[i]), base + USDHC_DAT_PORT_OFF);
+	}
+	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
+		return -2;
+	}
+	if (readl(base + USDHC_INT_STATUS_OFF) & (IRQSTAT_DTOE | IRQSTAT_CCE)) {
+		return -2;
+	}
+	writel(IRQSTAT_TC | IRQSTAT_BWTEN, base + USDHC_INT_STATUS_OFF);
+	return 0;
+}
+
+/**
+ * 等卡写编程完成：CMD13 SEND_STATUS 轮询 R1.READY_FOR_DATA(bit8)。
+ * CMD24 数据 TC 只代表主机搬完，卡内部烧写仍占线（DAT0 拉低）——
+ * 下一条数据命令前必须等它。超时 ~1s 量级（N 依 PIO 圈速）。
+ */
+static int mmc_wait_card_ready(struct mmc_card *card)
+{
+	u32 base = card->base;
+	u32 rsp0;
+	int ret;
+
+	for (int to = 0; to < 2000; to++) {
+		ret = usdhc_send_cmd(base, 13, card->rca << 16,
+				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+				     XFERTYP_CICEN, 0, &rsp0);
+		if (ret)
+			return -1;
+		if (rsp0 & BIT(8))		/* READY_FOR_DATA */
+			return 0;
+		if (rsp0 & 0xFDF98000U)		/* R1 错误位群（规范 5.1） */
+			return -2;
+	}
+	return -1;
 }
 
 /* ---- 卡识别层 ---- */
@@ -613,6 +659,45 @@ int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
 	return 0;
 }
 
+/**
+ * mmc_write_blocks() - 向卡的用户区写入若干 512 字节块
+ *
+ * CMD24 逐块写（与读路径 CMD17 同款 PIO 风格，多块 CMD25 是后续课题）。
+ * 每块后等卡编程完成（CMD13 READY_FOR_DATA）再发下一块。
+ *
+ * Return: 0 成功；-1 命令超时/错误；-2 数据错误；-3 卡编程未就绪
+ */
+int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
+		     const void *buf, void (*progress)(u32 done, u32 total))
+{
+	u32 base = card->base;
+	const u32 *p = buf;
+	int ret;
+
+	for (u32 i = 0; i < nblocks; i++) {
+		writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
+		ret = usdhc_send_cmd(base, 24, lba + i,
+				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+				     XFERTYP_CICEN | XFERTYP_DPSEL,
+				     MIX_CTRL_BCEN,		/* DTDSEL=0 写方向 */
+				     NULL);
+		if (ret) {
+			return -1;
+		}
+		if (usdhc_write_data_port(base, p, MMC_BLOCK_SIZE / 4)) {
+			return -2;
+		}
+		p += MMC_BLOCK_SIZE / 4;
+		if (mmc_wait_card_ready(card)) {
+			return -3;
+		}
+		if (progress) {
+			progress(i + 1, nblocks);
+		}
+	}
+	return 0;
+}
+
 /* ---- 通用块源实例：把卡协议驱动适配成 block_source 接口 ---- */
 
 static struct mmc_card sd_card;
@@ -629,10 +714,17 @@ static int sd_source_read(u32 lba, u32 nblocks, void *buf,
 	return mmc_read_blocks(&sd_card, lba, nblocks, buf, progress);
 }
 
+static int sd_source_write(u32 lba, u32 nblocks, const void *buf,
+			   void (*progress)(u32 done, u32 total))
+{
+	return mmc_write_blocks(&sd_card, lba, nblocks, buf, progress);
+}
+
 const struct block_source sd_source = {
 	.name = "SD (USDHC1)",
 	.init = sd_source_init,
 	.read = sd_source_read,
+	.write = sd_source_write,
 };
 
 static int emmc_source_init(void)
@@ -646,8 +738,15 @@ static int emmc_source_read(u32 lba, u32 nblocks, void *buf,
 	return mmc_read_blocks(&emmc_card, lba, nblocks, buf, progress);
 }
 
+static int emmc_source_write(u32 lba, u32 nblocks, const void *buf,
+			     void (*progress)(u32 done, u32 total))
+{
+	return mmc_write_blocks(&emmc_card, lba, nblocks, buf, progress);
+}
+
 const struct block_source emmc_source = {
 	.name = "eMMC (USDHC2)",
 	.init = emmc_source_init,
 	.read = emmc_source_read,
+	.write = emmc_source_write,
 };

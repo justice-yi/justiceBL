@@ -34,4 +34,11 @@ int emmc_init(struct mmc_card *card);
 int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
 		     void (*progress)(u32 done, u32 total));
 
+/**
+ * mmc_write_blocks() - 向卡的用户区写入若干 512 字节块（CMD24 逐块）
+ * 参数与返回同 mmc_read_blocks；-3 = 卡编程未就绪（CMD13 轮询超时）
+ */
+int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
+		     const void *buf, void (*progress)(u32 done, u32 total));
+
 #endif /* _JUSTICEBL_MMC_H */
