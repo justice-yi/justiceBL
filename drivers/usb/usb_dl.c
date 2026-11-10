@@ -68,16 +68,24 @@ static void hdr_to_buf(u8 *p, u8 cmd, u8 status, u32 lba, u32 count, u32 seq)
 }
 
 /* 应答发送（阻塞；主机不收的可能性由复位计数兜底退出） */
+/* 发送超时（忙等圈数 ~15s 量级）：主机读走或总线复位二选一，
+ * 都没有（主机进程被杀且未触发 reset）就放弃，防永久空转 */
+#define DL_TX_TIMEOUT_LOOPS	120000000u
+
 static int dl_tx(const void *p, u32 len)
 {
+	u32 to = DL_TX_TIMEOUT_LOOPS;
+
 	if (eng_ep_prime(1, 1, p, len))
 		return -1;
-	for (;;) {
+	while (to--) {
 		if (eng_reset_count() != last_reset)
 			return -1;		/* 总线复位：放弃本应答 */
 		if (eng_ep_check_done(1, 1))
 			return 0;
 	}
+	printf("usbdl: tx timeout, host stalled\n");
+	return -1;				/* 主机停读：放弃本次传输 */
 }
 
 static void dl_rx_arm(u32 len)
