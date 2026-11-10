@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 /*
- * justiceBL 主流程 v0.12 —— 介质无关：识别启动源 -> 初始化 -> [自检] -> 二级启动。
+ * justiceBL 主流程 v0.14 —— 纯编排，无寄存器操作（架构规矩见
+ * ~/.zcode/AGENTS.md 与 docs/CODING_STYLE.md）。
  *
- * 职责划分（全部只认 block_source 接口）：
+ * 职责划分：
+ *   board    "拨电路"：板级早期初始化（拆看门狗→断电链，board.c）
+ *   bootmode "回哪去"：消费 reboot-mode 魔数，loader -> USB 下载（bootmode.c）
  *   bootdev  "从哪来"：SRC 寄存器识别 -> 返回块源（SD/eMMC 现役，
  *            USB/UART 预留位）
  *   selftest "好不好"：仅开发调试（SELFTEST 宏开启时编译），不进生产路径
  *   boot     "到哪去"：解析二级镜像头，加载并跳转（不返回）
- *   main     纯编排：启动介质确定后只走该介质的流程
+ *   main     纯编排：init 调用 + 流程分发，不碰任何寄存器
  */
 
 #include <types.h>
@@ -16,6 +19,8 @@
 #include <timer.h>
 #include <blocksrc.h>
 #include <bootdev.h>
+#include <board.h>
+#include <bootmode.h>
 #include "boot.h"
 
 #ifdef JUSTICEBL_SELFTEST
@@ -34,6 +39,8 @@ int main(void)
 {
 	const struct block_source *src;
 
+	board_early_init();
+
 	uart_init();
 	if (timer_init()) {
 		halt_with_msg("syscounter not running");
@@ -43,6 +50,8 @@ int main(void)
 	 * 主机/账户由 Makefile 注入（BUILD_HOST/BUILD_USER），多机构建可溯源 */
 	printf("\njusticeBL %s %s %s@%s\n",
 	       __DATE__, __TIME__, BUILD_USER, BUILD_HOST);
+
+	bootmode_dispatch();		/* loader 魔数 -> USB 下载模式（不返回） */
 
 	src = boot_source_get();
 	if (!src) {

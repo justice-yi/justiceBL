@@ -35,7 +35,13 @@ OBJS := $(BUILD)/start.o \
 	$(BUILD)/drivers/led.o \
 	$(BUILD)/drivers/mmc.o \
 	$(BUILD)/drivers/bootdev.o \
+	$(BUILD)/drivers/board.o \
+	$(BUILD)/drivers/bootmode.o \
 	$(BUILD)/drivers/timer.o \
+	$(BUILD)/drivers/usb/usb_ch9.o \
+	$(BUILD)/drivers/usb/usbd_soc.o \
+	$(BUILD)/drivers/usb/usbd.o \
+	$(BUILD)/drivers/usb/usb_dl.o \
 	$(BUILD)/lib/crc32.o \
 	$(BUILD)/lib/math.o \
 	$(BUILD)/lib/printf.o
@@ -60,6 +66,12 @@ $(BUILD)/$(TARGET)-ddr.bin: $(BUILD)/$(TARGET)-ddr.elf
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
+
+# banner（main.c 的 __DATE__/__TIME__）是构建指纹——main.c 不改也要重编，
+# 否则连续构建时指纹冻结，烧没烧新版一眼无从分辨（2026-11-08 踩坑）
+.PHONY: FORCE
+FORCE:
+$(BUILD)/main.o: FORCE
 
 $(BUILD)/%.o: %.S
 	@mkdir -p $(dir $@)
