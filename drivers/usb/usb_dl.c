@@ -168,8 +168,13 @@ static void handle_hdr(u32 len)
 				return;
 			if (n > JBDL_CHUNK / 512)
 				n = JBDL_CHUNK / 512;
-			if (src->read(h.lba + done, n, data_buf, 0))
-				break;		/* 读错：中断传输（host 超时收场） */
+			if (src->read(h.lba + done, n, data_buf, 0)) {
+				/* 读错：中断传输（host 超时收场）。v1 协议
+				 * 头已回 OK 无法中途改报错，只能弃流 */
+				printf("usbdl: media read fail @lba%u, abort stream\n",
+				       h.lba + done);
+				break;
+			}
 			bytes = n * 512;
 			if (dl_tx(data_buf, bytes))
 				return;
