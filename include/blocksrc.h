@@ -19,6 +19,7 @@
  * @read:	读 nblocks 个 512B 块到 buf；0 成功。progress 可为 NULL
  * @write:	把 buf 的 nblocks 个 512B 块写到 lba；0 成功。
  *		NULL = 只读介质（如预留的串口下载通道）
+ * @blocks:	用户区容量（512B 块数）；NULL = 未知
  */
 struct block_source {
 	const char *name;
@@ -27,6 +28,7 @@ struct block_source {
 		    void (*progress)(u32 done, u32 total));
 	int (*write)(u32 lba, u32 nblocks, const void *buf,
 		     void (*progress)(u32 done, u32 total));
+	u32 (*blocks)(void);
 };
 
 /* 已注册的全部块源（索引即自检遍历顺序，bootdev.c 定义）*/

@@ -333,12 +333,32 @@ static int mmc_wait_card_ready(struct mmc_card *card)
 				     XFERTYP_CICEN, 0, &rsp0);
 		if (ret)
 			return -1;
+		/* R1 错误位群（规范 5.1；原掩码漏 WP_VIOLATION bit26——
+		 * 烧录场景最相关的一位）。先查错再查就绪：卡拒绝写入
+		 * （如写保护）时常同时置 WP_VIOLATION+READY_FOR_DATA，
+		 * 顺序反了会把失败当成功（第四轮评审 M5） */
+		if (rsp0 & 0xFFF98000U)
+			return -2;
 		if (rsp0 & BIT(8))		/* READY_FOR_DATA */
 			return 0;
-		if (rsp0 & 0xFDF98000U)		/* R1 错误位群（规范 5.1） */
-			return -2;
 	}
 	return -1;
+}
+
+/*
+ * R2（136 位响应）去移位：USDHC 捕获时整体多采 8 位（RSP0=CSD[39:8]，
+ * 最低字节是响应前沿位，"lowest 8 bit is invalid bit"），须就地串接成
+ * 规范布局后才能按规范位段解析。NXP SDK USDHC_ReceiveCommandResponse
+ * 与第三方参考项目逐位同款（证据：fsl_usdhc.c R2 分支、
+ * NoosProgramProject/14_TF卡编程 sd.c USDHC_GetResponse）。
+ * 修前 SD 容量读出差 8 位（第四轮评审 H1，INFO 回显即现形）。
+ */
+static void r2_deshift(u32 raw[4])
+{
+	raw[3] = (raw[3] << 8) | ((raw[2] >> 24) & 0xFF);
+	raw[2] = (raw[2] << 8) | ((raw[1] >> 24) & 0xFF);
+	raw[1] = (raw[1] << 8) | ((raw[0] >> 24) & 0xFF);
+	raw[0] <<= 8;
 }
 
 /* ---- 卡识别层 ---- */
@@ -485,6 +505,7 @@ static int emmc_speed_up(u32 base)
 	if (hz < 0) {
 		return -3;
 	}
+
 	printf("emmc: 4-bit, %u kHz\n", (u32)hz / 1000);
 	return 0;
 }
@@ -549,7 +570,7 @@ int sd_init(struct mmc_card *card)
 	for (i = 0; i < 4; i++) {
 		card->csd_raw[i] = readl(base + USDHC_RSP0_OFF + i * 4);
 	}
-	/* 注意：R2 的 4 个字是大端序，本驱动只透传原始值 */
+	r2_deshift(card->csd_raw);		/* 去硬件 8 位偏移 -> 规范布局 */
 
 	ret = usdhc_send_cmd(base, 7, card->rca, XFERTYP_RSPTYP_48_BUSY, 0,
 			     NULL);		/* SELECT_CARD (R1b) */
@@ -560,6 +581,19 @@ int sd_init(struct mmc_card *card)
 	ret = sd_speed_up(base, card->rca);
 	if (ret) {
 		return -6;
+	}
+
+	/*
+	 * SD v2.0 容量：CSD[69:48] = C_SIZE（22 位），容量 = (C_SIZE+1)*512KB。
+	 * csd_raw 已去移位（r2_deshift）为规范 CSD 布局，标准公式直用；
+	 * INFO 会回显容量供人工核对（读回校验文化：解析错了立刻可见）。
+	 */
+	{
+		u32 c_size = ((card->csd_raw[2] & 0x3F) << 16) |
+			     ((card->csd_raw[1] >> 16) & 0xFFFF);
+		card->blocks = (c_size + 1) * 1024;	/* (C_SIZE+1)*512KB */
+		printf("sd: capacity %u blocks (%u MiB)\n", card->blocks,
+		       card->blocks / 2048);
 	}
 
 	card->base = base;
@@ -612,6 +646,7 @@ int emmc_init(struct mmc_card *card)
 	for (i = 0; i < 4; i++) {
 		card->csd_raw[i] = readl(base + USDHC_RSP0_OFF + i * 4);
 	}
+	r2_deshift(card->csd_raw);		/* 去硬件 8 位偏移 -> 规范布局 */
 
 	ret = usdhc_send_cmd(base, 7, card->rca, XFERTYP_RSPTYP_48_BUSY, 0,
 			     NULL);
@@ -622,6 +657,29 @@ int emmc_init(struct mmc_card *card)
 	ret = emmc_speed_up(base);
 	if (ret) {
 		return -5;
+	}
+
+	/*
+	 * eMMC 容量：CMD8 SEND_EXT_CSD -> SEC_COUNT[215:212]（LE）。
+	 * CSD v3 对 >2GB 不含容量，必须走 EXT_CSD；数据口机制与读路径
+	 * 同款（R1 + BRR 收 512B，bswap 归一后 w[53] 即 SEC_COUNT）。
+	 */
+	writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
+	ret = usdhc_send_cmd(base, 8, card->rca << 16,
+			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+			     XFERTYP_CICEN | XFERTYP_DPSEL,
+			     MIX_CTRL_BCEN | MIX_CTRL_DTDSEL_READ, &r);
+	{
+		u32 ext[MMC_BLOCK_SIZE / 4];
+
+		if (ret || usdhc_read_data_port(base, ext, MMC_BLOCK_SIZE / 4)) {
+			printf("emmc: EXT_CSD read failed, blocks unknown\n");
+			card->blocks = 0;
+		} else {
+			card->blocks = ext[53];
+			printf("emmc: capacity %u blocks (%u MiB)\n",
+			       card->blocks, card->blocks / 2048);
+		}
 	}
 
 	card->base = base;
@@ -665,7 +723,8 @@ int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
  * CMD24 逐块写（与读路径 CMD17 同款 PIO 风格，多块 CMD25 是后续课题）。
  * 每块后等卡编程完成（CMD13 READY_FOR_DATA）再发下一块。
  *
- * Return: 0 成功；-1 命令超时/错误；-2 数据错误；-3 卡编程未就绪
+ * Return: 0 成功；-1 命令超时/错误；-2 数据错误；-3 卡编程未就绪；
+ *         -4 越界/容量未知（烧录必须 fail closed，不许盲写）
  */
 int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
 		     const void *buf, void (*progress)(u32 done, u32 total))
@@ -673,6 +732,15 @@ int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
 	u32 base = card->base;
 	const u32 *p = buf;
 	int ret;
+
+	/* 容量兜底（第四轮评审 L1）：JBDL 层有 H1 校验，但 EXT_CSD/CSD
+	 * 解析失败时 blocks=0 会让整条防线失效——这里 fail closed */
+	if (!card->blocks ||
+	    (u64)lba + (u64)nblocks > card->blocks) {
+		printf("mmc: write refuse lba=%u n=%u cap=%u\n",
+		       lba, nblocks, card->blocks);
+		return -4;
+	}
 
 	for (u32 i = 0; i < nblocks; i++) {
 		writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
@@ -720,11 +788,17 @@ static int sd_source_write(u32 lba, u32 nblocks, const void *buf,
 	return mmc_write_blocks(&sd_card, lba, nblocks, buf, progress);
 }
 
+static u32 sd_source_blocks(void)
+{
+	return sd_card.blocks;
+}
+
 const struct block_source sd_source = {
 	.name = "SD (USDHC1)",
 	.init = sd_source_init,
 	.read = sd_source_read,
 	.write = sd_source_write,
+	.blocks = sd_source_blocks,
 };
 
 static int emmc_source_init(void)
@@ -744,9 +818,15 @@ static int emmc_source_write(u32 lba, u32 nblocks, const void *buf,
 	return mmc_write_blocks(&emmc_card, lba, nblocks, buf, progress);
 }
 
+static u32 emmc_source_blocks(void)
+{
+	return emmc_card.blocks;
+}
+
 const struct block_source emmc_source = {
 	.name = "eMMC (USDHC2)",
 	.init = emmc_source_init,
 	.read = emmc_source_read,
 	.write = emmc_source_write,
+	.blocks = emmc_source_blocks,
 };

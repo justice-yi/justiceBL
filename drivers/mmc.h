@@ -15,7 +15,9 @@ struct mmc_card {
 	u32 rca;		/**< 卡相对地址（识别流程分配） */
 	u8 is_emmc;		/**< 1 = eMMC（CMD1 流程），0 = SD（ACMD41 流程） */
 	u8 pad[3];
-	u32 csd_raw[4];		/**< 原始 CSD（R2 响应原样，调试/容量解析用） */
+	u32 csd_raw[4];		/**< CSD 原始位（R2 响应经 r2_deshift 去硬件
+				  * 8 位偏移后的规范布局，调试/容量解析用） */
+	u32 blocks;		/**< 用户区容量（512B 块数；0 = 未知） */
 };
 
 int sd_init(struct mmc_card *card);
