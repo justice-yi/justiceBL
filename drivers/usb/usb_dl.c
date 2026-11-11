@@ -90,8 +90,10 @@ static int dl_tx(const void *p, u32 len)
 
 static void dl_rx_arm(u32 len)
 {
-	eng_ep_prime(1, 0, (state == ST_HDR) ? hdr_buf : data_buf, len);
-	rx_armed = 1;
+	/* prime 失败不置 armed：下轮 poll 重试，防"假武装"卡死
+	 * （armed 但无 dTD -> 主机写入被 NAK 到超时） */
+	rx_armed = eng_ep_prime(1, 0,
+				(state == ST_HDR) ? hdr_buf : data_buf, len) == 0;
 }
 
 static u32 dl_rx_len(void)
@@ -125,6 +127,24 @@ static void handle_hdr(u32 len)
 		return;
 	}
 
+	/* H1 边界校验（64 位防 u32 回绕）：越界/回绕一律 ST_ERR，
+	 * 让 host 端拿到确定性错误而非 30s 超时+弃流 */
+	if ((h.cmd == JBDL_READ || h.cmd == JBDL_WRITE) && src) {
+		u32 cap = src->blocks ? src->blocks() : 0;
+
+		if (cap && (u64)h.lba + (u64)h.count > cap) {
+			hdr_to_buf(hdr_buf, h.cmd, JBDL_ST_ERR, h.lba,
+				   h.count, 0);
+			if (dl_tx(hdr_buf, JBDL_HDR_LEN))
+				return;
+			state = ST_HDR;
+			printf("usbdl: %s out-of-range lba=%u count=%u cap=%u\n",
+			       h.cmd == JBDL_READ ? "READ" : "WRITE",
+			       h.lba, h.count, cap);
+			return;
+		}
+	}
+
 	switch (h.cmd) {
 	case JBDL_PING:
 		hdr_to_buf(hdr_buf, JBDL_PING, 0x4F, 0, 0, 0);
@@ -133,13 +153,15 @@ static void handle_hdr(u32 len)
 		break;
 
 	case JBDL_INFO: {
-		static char info[96];
+		static char info[112];
 		u32 ilen;
+		u32 cap = (src && src->blocks) ? src->blocks() : 0;
 
-		/* 容量解析需 CSD，v1 先给介质名+协议版本（够 flashtool 展示身份） */
 		ilen = (u32)snprintf(info, sizeof(info),
-				     "justiceBL dl v%d media=%s", JBDL_VER,
-				     src ? src->name : "none");
+				     "justiceBL dl v%d media=%s cap=%u blocks",
+				     JBDL_VER, src ? src->name : "none", cap);
+		if (ilen >= sizeof(info))
+			ilen = sizeof(info) - 1;	/* 截断钳位：防越界读 */
 		hdr_to_buf(hdr_buf, JBDL_INFO, JBDL_ST_OK, 0, ilen, 0);
 		if (dl_tx(hdr_buf, JBDL_HDR_LEN))
 			return;
@@ -178,6 +200,11 @@ static void handle_hdr(u32 len)
 			bytes = n * 512;
 			if (dl_tx(data_buf, bytes))
 				return;
+			if (eng_last_xfer_err()) {
+				printf("usbdl: IN dTD err=0x%x, abort stream\n",
+				       eng_last_xfer_err());
+				break;
+			}
 			done += n;
 		}
 		break;
@@ -219,7 +246,7 @@ static void handle_wdata(u32 len)
 	if (len != blocks * 512) {
 		werr = 1;			/* 短包：按错收处理，等 host 收 DONE */
 		blocks_left = 0;
-	} else if (src->write(cur_lba, blocks, data_buf, 0)) {
+	} else if (blocks && src->write(cur_lba, blocks, data_buf, 0)) {
 		werr = 2;
 		blocks_left = 0;
 	} else {
@@ -229,8 +256,11 @@ static void handle_wdata(u32 len)
 	if (!blocks_left) {
 		hdr_to_buf(hdr_buf, JBDL_WRITE_DONE, werr ? JBDL_ST_ERR : JBDL_ST_OK,
 			   cur_lba, 0, 0);
-		if (dl_tx(hdr_buf, JBDL_HDR_LEN))
+		if (dl_tx(hdr_buf, JBDL_HDR_LEN)) {
+			state = ST_HDR;		/* 发 DONE 失败：回头重收，
+						 * 防卡 ST_WDATA 反复空 arm（评审 L5） */
 			return;
+		}
 		state = ST_HDR;
 	}
 }
@@ -250,8 +280,23 @@ void usb_dl_start(void)
 
 void usb_dl_poll(void)
 {
-	if (!src)
-		return;
+	/* M4：介质不可用（无卡/init 失败）时协议层不再全哑——
+	 * PING 照常 ack，READ/WRITE/INFO 走 handle_hdr 的 !src 错误分支，
+	 * host 端有区分度（不会 30s 超时误判协议坏了） */
+
+	/* EP1 意外 stall 自愈（谁置的一打便知：打印一次并清除）。
+	 * 主机侧表现为 LIBUSB_ERROR_PIPE——不清则 WinUSB 永久 halt 管道 */
+	{
+		u32 st = eng_ep1_stall_recover();
+
+		if (st) {
+			printf("usbdl: ep1 stall detected (%s%s) cleared\n",
+			       (st & 0xFFFF) ? "rx" : "",
+			       (st >> 16) ? "+tx" : "");
+			rx_armed = 0;		/* stall 期间 prime 可能已丢 */
+		}
+	}
+
 	if (dl_reset_seen())
 		return;
 
@@ -265,16 +310,27 @@ void usb_dl_poll(void)
 			u32 len = dl_rx_len();
 
 			rx_armed = 0;
-			handle_hdr(len);
+			/* 头 dTD 报错同样按错收丢弃（评审 L3）：报错头的
+			 * 内容不可信，解析可能撞出合法命令 */
+			if (eng_last_xfer_err()) {
+				printf("usbdl: HDR dTD err=0x%x, dropped\n",
+				       eng_last_xfer_err());
+			} else {
+				handle_hdr(len);
+			}
 		}
 		break;
 
 	case ST_WDATA:
 		if (!rx_armed) {
-			u32 bytes = blocks_left * 512;
+			u32 nblk = blocks_left;
+			u32 bytes;
 
-			if (bytes > JBDL_CHUNK)
-				bytes = JBDL_CHUNK;
+			/* 先钳块数再乘：blocks_left*512 在大分区（>2^23 块）
+			 * 时 u32 回绕，arm 长度错乱（评审 M4） */
+			if (nblk > JBDL_CHUNK / 512)
+				nblk = JBDL_CHUNK / 512;
+			bytes = nblk * 512;
 			dl_rx_arm(bytes);
 			break;
 		}
@@ -282,6 +338,15 @@ void usb_dl_poll(void)
 			u32 len = dl_rx_len();
 
 			rx_armed = 0;
+			/* M1：dTD 报错（babble/buffer）按错收处理——
+			 * 数据完整性存疑，不能当正常块写下去 */
+			if (eng_last_xfer_err()) {
+				printf("usbdl: OUT dTD err=0x%x\n",
+				       eng_last_xfer_err());
+				werr = 3;
+				blocks_left = 0;
+				len = 0;
+			}
 			handle_wdata(len);
 		}
 		break;

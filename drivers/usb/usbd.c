@@ -116,6 +116,9 @@ static struct usb_dtd dtd[4] __attribute__((aligned(32)));	/* 与 qh 同序的 d
 static u8 dev_addr;		/* 当前 USB 设备地址（总线复位归 0） */
 static u32 primed_len[4];	/* 各方向 prime 的字节数（rx_len 反推实收用） */
 static u32 eng_rst_cnt;		/* 总线复位事件计数（协议层自愈用） */
+static u32 eng_xfer_err;	/* 上一次传输的 dTD 错误位（M1） */
+static u32 ep1_sw_halt;		/* host SET_FEATURE(ENDPOINT_HALT) 请求的 halt：
+				 * 置位期间 poll 自愈不得清除（评审 M2） */
 
 /* 逐字节拷贝（freestanding 无 libc） */
 static void xcopy(void *dst, const void *src, u32 n)
@@ -177,6 +180,10 @@ int eng_ep_prime(u8 ep, u8 tx, const void *buf, u32 len)
 
 	qh[idx].next_dtd = (u32)d;		/* T=0：指针有效 */
 	primed_len[idx] = len;
+	eng_xfer_err = 0;
+	/* ARM posted write：dTD/dQH 内容必须先于 PRIME 寄存器写到达——
+	 * 无 cache 时是防御性屏障，将来开 cache 后是必需（评审 M 建议） */
+	__asm__ volatile ("dmb ish" ::: "memory");
 
 	/* 写 PRIME 位；硬件把 dTD 拷进 dQH overlay，位置就绪 */
 	usbd_soc_wr32(R_ENDPTPRIME, bit);
@@ -219,7 +226,16 @@ int eng_ep_check_done(u8 ep, u8 tx)
 	if (!(usbd_soc_rd32(R_ENDPTCOMPLETE) & bit))
 		return 0;
 	usbd_soc_wr32(R_ENDPTCOMPLETE, bit);
+	/* M1：dTD 错误位（HALTED/BufferError/TxError）——
+	 * USB 包级 CRC 由硬件重传保证，这里只捕 babble/buffer 异常 */
+	eng_xfer_err = dtd[QH_IDX(ep, tx)].token & 0x7E;
 	return 1;
+}
+
+/* 上一次传输的 dTD 错误位（0=正常）；prime 时自动清零 */
+u32 eng_last_xfer_err(void)
+{
+	return eng_xfer_err;
 }
 
 /* 上一次 OUT 实收字节数 = prime 长度 - dTD 剩余量（check_done=1 后读） */
@@ -234,6 +250,76 @@ u32 eng_ep_rx_len(u8 ep, u8 tx)
 u32 eng_reset_count(void)
 {
 	return eng_rst_cnt;
+}
+
+/* EP1 双向 FLUSH：清挂起 dTD 并复位 data toggle（RM 56.4.6.4.4），
+ * 有界等待；清 stall 位前必须 flush，否则残留 dTD 与后续 prime 竞态 */
+static void ep1_flush(void)
+{
+	u32 bits = EPBIT(USB_BULK_EP, 0) | EPBIT(USB_BULK_EP, 1);
+	u32 to = WAIT_LOOPS;
+
+	usbd_soc_wr32(R_ENDPTFLUSH, bits);
+	while ((usbd_soc_rd32(R_ENDPTFLUSH) & bits) && --to)
+		;
+}
+
+/* 清 EP1 双向 stall 位，返回清除的位 */
+static u32 ep1_clear_stall_bits(void)
+{
+	u32 ctrl = R_ENDPTCTRL0 + 4 * USB_BULK_EP;
+	u32 c = usbd_soc_rd32(ctrl);
+	u32 hit = c & (EPCTRL_RXS | EPCTRL_TXS);
+
+	if (hit)
+		usbd_soc_wr32(ctrl, c & ~hit);
+	return hit;
+}
+
+/* EP1 stall 自愈：host 请求的 halt（ep1_sw_halt）期间不撤；否则先 FLUSH
+ * （复位 data toggle + 丢挂起 dTD）再清 stall 位。返回清除的位（0=无动作），
+ * 调用方打印定位 */
+u32 eng_ep1_stall_recover(void)
+{
+	u32 hit;
+
+	if (ep1_sw_halt)
+		return 0;
+	hit = ep1_clear_stall_bits();
+	if (hit)
+		ep1_flush();
+	return hit;
+}
+
+/* host SET_FEATURE(ENDPOINT_HALT)：只置寻址方向的 stall（评审 M1/M2） */
+void eng_ep1_set_stall(u8 dir_in)
+{
+	u32 ctrl = R_ENDPTCTRL0 + 4 * USB_BULK_EP;
+	u32 c = usbd_soc_rd32(ctrl);
+
+	ep1_sw_halt = 1;
+	usbd_soc_wr32(ctrl, c | (dir_in ? EPCTRL_TXS : EPCTRL_RXS));
+}
+
+/* host CLEAR_FEATURE(ENDPOINT_HALT)：解除软件 halt + FLUSH 复位 toggle */
+void eng_ep1_halt_clear(void)
+{
+	ep1_sw_halt = 0;
+	ep1_flush();
+	ep1_clear_stall_bits();
+}
+
+/* EP1 halt 状态（GET_STATUS(endpoint) 应答用）：bit0=RXS bit1=TXS */
+u32 eng_ep1_halt_bits(void)
+{
+	u32 c = usbd_soc_rd32(R_ENDPTCTRL0 + 4 * USB_BULK_EP);
+	u32 bits = 0;
+
+	if (c & EPCTRL_RXS)
+		bits |= 1;
+	if (c & EPCTRL_TXS)
+		bits |= 2;
+	return bits;
 }
 
 /* ---- EP0 处理 ---- */
@@ -302,6 +388,37 @@ static void ep0_handle_setup(void)
 	s.wIndex = raw[4] | ((u16)raw[5] << 8);
 	s.wLength = raw[6] | ((u16)raw[7] << 8);
 
+	/* GET_STATUS(endpoint)：应答数据是 ENDPTCTRL 里的 halt 位，协议层
+	 * 不知道硬件——引擎自己组 2 字节。USB 2.0 9.4.5：wIndex = 端点地址
+	 * （bit7 方向），被寻址端点的 Halt 回 byte0.bit0，byte1 保留 0
+	 * （评审 M1：修前方向位被无视，0x81 被 STALL） */
+	if ((s.bmRequestType & 0x1F) == 2 &&
+	    s.bRequest == USB_REQ_GET_STATUS) {
+		static u8 ep_st[2];
+		u8 epnum = s.wIndex & 0x0F;
+		u8 dir_in = (s.wIndex >> 7) & 1;
+		int fail;
+
+		if (s.wLength < 2 || (epnum != 0 && epnum != USB_BULK_EP)) {
+			ep0_stall();
+			return;
+		}
+		if (epnum == USB_BULK_EP) {
+			u32 h = eng_ep1_halt_bits();
+
+			ep_st[0] = (dir_in ? (h & 2) : (h & 1)) ? 1 : 0;
+		} else {
+			ep_st[0] = 0;			/* ep0 恒不 halt */
+		}
+		ep_st[1] = 0;
+		fail = eng_ep_prime(0, 1, ep_st, 2) ||
+		       eng_ep_wait_done(0, 1) ||
+		       eng_ep_prime(0, 0, 0, 0);
+		if (!fail)
+			eng_ep_wait_done(0, 0);
+		return;
+	}
+
 	usb_ch9_handle_setup(&s, &r);
 
 	switch (r.action) {
@@ -334,6 +451,16 @@ static void ep0_handle_setup(void)
 		ep0_status_in();
 		break;
 
+	case USB_CH9_EP1_CLEAR_HALT:
+		eng_ep1_halt_clear();
+		ep0_status_in();
+		break;
+
+	case USB_CH9_EP1_SET_HALT:
+		eng_ep1_set_stall(r.ep_dir);
+		ep0_status_in();
+		break;
+
 	case USB_CH9_STALL:
 	default:
 		ep0_stall();
@@ -350,6 +477,8 @@ static void bus_reset(void)
 
 	dev_addr = 0;
 	usbd_soc_wr32(R_DEVICEADDR, 0);
+	ep1_sw_halt = 0;		/* host 请求的 halt 随复位解除 */
+	usb_ch9_reset();		/* 协议层状态归零（configured 等，评审 M3） */
 
 	/* 冲掉所有挂起的传输缓冲（buffer ready 被 USB reset 自动清，这里兜底） */
 	usbd_soc_wr32(R_ENDPTFLUSH, flush);
