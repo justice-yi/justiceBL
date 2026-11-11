@@ -158,9 +158,9 @@ void usb_ch9_init(void)
 	ms_os_string[17] = 0x00;
 }
 
-u8 usb_ch9_configured(void)
+void usb_ch9_reset(void)
 {
-	return configured;
+	configured = 0;		/* 总线复位 -> 未配置态（评审 M3） */
 }
 
 /*
@@ -188,6 +188,37 @@ void usb_ch9_handle_setup(const struct usb_setup *s, struct usb_ch9_reply *r)
 		return;
 	}
 
+	/* 端点接收者（bmRequestType[4:0]==2）：halt 的状态在硬件里（引擎截获
+	 * GET_STATUS-EP1），这里只做 CLEAR/SET_FEATURE(ENDPOINT_HALT) 的按号
+	 * 路由。USB 2.0 9.4.5：wIndex = 端点地址——低 4 位端点号、bit7 方向
+	 * 位（0x01=OUT 0x81=IN 都要认，host 对 IN 端点 clear_halt 是常规
+	 * 操作；评审 M1） */
+	if ((s->bmRequestType & 0x1F) == 2) {
+		u8 epnum = s->wIndex & 0x0F;
+
+		if (s->wValue == USB_FEATURE_ENDPOINT &&
+		    s->bRequest == USB_REQ_CLEAR_FEATURE) {
+			if (epnum == 0) {
+				r->action = USB_CH9_EP0_CLEAR_HALT;
+				return;
+			}
+			if (epnum == USB_BULK_EP) {
+				r->action = USB_CH9_EP1_CLEAR_HALT;
+				r->ep_dir = (s->wIndex >> 7) & 1;
+				return;
+			}
+		}
+		if (s->wValue == USB_FEATURE_ENDPOINT &&
+		    s->bRequest == USB_REQ_SET_FEATURE &&
+		    epnum == USB_BULK_EP) {
+			r->action = USB_CH9_EP1_SET_HALT;
+			r->ep_dir = (s->wIndex >> 7) & 1;
+			return;
+		}
+		r->action = USB_CH9_STALL;
+		return;
+	}
+
 	switch (s->bRequest) {
 	case USB_REQ_GET_DESCRIPTOR: {
 		u8 type = s->wValue >> 8;
@@ -208,7 +239,9 @@ void usb_ch9_handle_setup(const struct usb_setup *s, struct usb_ch9_reply *r)
 		case USB_DESC_QUALIFIER:
 			r->action = USB_CH9_DATA_IN;
 			r->data = &qual_desc;
-			r->len = cap < sizeof(qual_desc) ? cap : sizeof(qual_desc);
+			/* qual_desc 复用 18B 结构体但 bLength=10：上限必须钳到
+			 * bLength，否则多发 8 字节垃圾尾巴 */
+			r->len = cap < qual_desc.bLength ? cap : qual_desc.bLength;
 			return;
 		case USB_DESC_STRING:
 			r->action = USB_CH9_DATA_IN;
@@ -231,14 +264,55 @@ void usb_ch9_handle_setup(const struct usb_setup *s, struct usb_ch9_reply *r)
 	}
 
 	case USB_REQ_GET_STATUS:
-		/* 设备状态：bit0 自供电=0，bit1 远程唤醒=0 */
+		/* 设备状态：bit0 自供电=0，bit1 远程唤醒=0。
+		 * 端点接收者已在上面路由（halt 位在硬件里）；
+		 * 接口接收者（recipient==1）：两位全 0 */
+		if ((s->bmRequestType & 0x1F) == 1 && s->wIndex != 0) {
+			r->action = USB_CH9_STALL;		/* 无接口 1 */
+			return;
+		}
 		r->action = USB_CH9_DATA_IN;
 		r->data = "\0\0";
 		r->len = 2;
 		return;
 
+	case USB_REQ_GET_CONFIGURATION:
+		/* 标准请求里唯一"读设备状态"的：值在协议层自己手里 */
+		if ((s->bmRequestType & 0x1F) != 0 || s->wLength < 1) {
+			r->action = USB_CH9_STALL;
+			return;
+		}
+		r->action = USB_CH9_DATA_IN;
+		r->data = &configured;
+		r->len = 1;
+		return;
+
+	case USB_REQ_GET_INTERFACE:
+		/* 单接口无 alt setting，恒 0；接口号不对则 stall */
+		if ((s->bmRequestType & 0x1F) != 1 || s->wIndex != 0 ||
+		    s->wLength < 1) {
+			r->action = USB_CH9_STALL;
+			return;
+		}
+		r->action = USB_CH9_DATA_IN;
+		r->data = "\0";
+		r->len = 1;
+		return;
+
 	case USB_REQ_SET_ADDRESS:
 	case USB_REQ_SET_CONFIGURATION:
+		/* SET_CONFIGURATION(0..1) 的语义结果存协议层（GET_CONFIGURATION 读回）；
+		 * 超出配置数的值 stall（USB 2.0 9.4.7） */
+		if (s->bRequest == USB_REQ_SET_CONFIGURATION &&
+		    (s->wValue & 0xFF) > 1) {
+			r->action = USB_CH9_STALL;
+			return;
+		}
+		if (s->bRequest == USB_REQ_SET_CONFIGURATION)
+			configured = s->wValue & 0xFF;
+		r->action = USB_CH9_STATUS_IN;
+		return;
+
 	case USB_REQ_SET_INTERFACE:
 		/* 无数据阶段，状态阶段回 ZLP 即可 */
 		r->action = USB_CH9_STATUS_IN;

@@ -22,6 +22,7 @@
 #define USB_REQ_SET_DESCRIPTOR		0x07
 #define USB_REQ_GET_CONFIGURATION	0x08
 #define USB_REQ_SET_CONFIGURATION	0x09
+#define USB_REQ_GET_INTERFACE		0x0A
 #define USB_REQ_SET_INTERFACE		0x0B
 
 #define USB_DESC_DEVICE			0x01
@@ -100,6 +101,10 @@ enum usb_ch9_action {
 	USB_CH9_DATA_IN,	/* 数据阶段：主机读，回 reply.data/len */
 	USB_CH9_STATUS_IN,	/* 无数据阶段：状态阶段回 ZLP（IN 方向） */
 	USB_CH9_EP0_CLEAR_HALT,	/* 主机要求解除 ep0 stall：引擎清 ENDPTCTRL0 */
+	USB_CH9_EP1_CLEAR_HALT,	/* 主机对 bulk EP1 CLEAR_FEATURE(ENDPOINT_HALT)：
+				 * 引擎解除 halt（FLUSH 复位 toggle + 清 stall） */
+	USB_CH9_EP1_SET_HALT,	/* 主机对 bulk EP1 SET_FEATURE(ENDPOINT_HALT)：
+				 * 引擎置寻址方向的 stall（reply.ep_dir） */
 	USB_CH9_STALL,		/* 不认识/不支持：协议 stall（两个方向成对） */
 };
 
@@ -107,6 +112,9 @@ struct usb_ch9_reply {
 	enum usb_ch9_action	action;
 	const void		*data;	/* USB_CH9_DATA_IN 时的数据源 */
 	u16			len;
+	u8			ep_dir;	/* EP1 SET/CLEAR_HALT：0=OUT(wIndex=0x01)
+					 * 1=IN(0x81)，取自 wIndex 方向位
+					 * （USB 2.0 9.4.5，评审 M1） */
 };
 
 /* 构造描述符与字符串（上电一次；把 ascii 名字转成 UTF-16LE 描述符） */
@@ -115,7 +123,7 @@ void usb_ch9_init(void);
 /* 解码 setup 包 -> 应答动作。纯函数：不碰硬件、无副作用 */
 void usb_ch9_handle_setup(const struct usb_setup *s, struct usb_ch9_reply *r);
 
-/* 引擎查询当前配置值（SET_CONFIGURATION 语义上的结果） */
-u8 usb_ch9_configured(void);
+/* 协议状态归零（总线复位时引擎调用）：configured 等回默认态 */
+void usb_ch9_reset(void);
 
 #endif /* _JUSTICEBL_USB_CH9_H */
