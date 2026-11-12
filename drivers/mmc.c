@@ -58,6 +58,12 @@
 #define IRQSTAT_CTOE		BIT(16)
 #define IRQSTAT_CCE		BIT(17)
 #define IRQSTAT_DTOE		BIT(20)
+/* PSTATE（RM 58.8.6）：发命令前须等三位全清（U-Boot fsl_esdhc.c:358-363
+ * 同款三连等）。写块 TC 后卡拉 DAT0 编程忙期间 DLA 仍置位，不等就发
+ * 命令会被控制器压住——CC 永不到来、也等不到超时错误（2026-11-13 实证） */
+#define PSTATE_CIHB		BIT(0)		/* Command Inhibit (CMD) */
+#define PSTATE_CIDHB		BIT(1)		/* Command Inhibit (DAT) */
+#define PSTATE_DLA		BIT(2)		/* Data Line Active */
 #define SYSCTL_RSTA		BIT(24)
 #define SYSCTL_RSTC		BIT(25)
 #define SYSCTL_RSTD		BIT(26)
@@ -252,8 +258,9 @@ static int usdhc_hw_init(u32 base)
 static int usdhc_send_cmd(u32 base, u8 idx, u32 arg, u32 xfr_hi, u32 mix_lo,
 			  u32 *rsp0)
 {
-	if (!usdhc_wait_clear(base, USDHC_PRES_STATE_OFF, BIT(0))) {
-		return -1;	/* CMDINHIB：命令线忙 */
+	if (!usdhc_wait_clear(base, USDHC_PRES_STATE_OFF,
+			      PSTATE_CIHB | PSTATE_CIDHB | PSTATE_DLA)) {
+		return -1;	/* 总线未空闲：命令/数据 inhibit 或数据线忙 */
 	}
 	writel(0xFFFFFFFF, base + USDHC_INT_STATUS_OFF);
 	writel(arg, base + USDHC_CMD_ARG_OFF);
@@ -278,6 +285,7 @@ static int usdhc_send_cmd(u32 base, u8 idx, u32 arg, u32 xfr_hi, u32 mix_lo,
 static int usdhc_read_data_port(u32 base, u32 *w, u32 nwords)
 {
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BRR)) {
+		printf("mmc: rport BRR timeout\n");
 		return -1;
 	}
 	/* 数据端口是大端语义（板上实测 v0.5 MISMATCH → swab32 全匹配确诊），
@@ -286,10 +294,14 @@ static int usdhc_read_data_port(u32 base, u32 *w, u32 nwords)
 		w[i] = __builtin_bswap32(readl(base + USDHC_DAT_PORT_OFF));
 	}
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
+		printf("mmc: rport TC timeout, sts=%08x\n",
+		       readl(base + USDHC_INT_STATUS_OFF));
 		return -2;
 	}
 	if (readl(base + USDHC_INT_STATUS_OFF) &
 	    (IRQSTAT_DTOE | IRQSTAT_CCE)) {
+		printf("mmc: rport data err, sts=%08x\n",
+		       readl(base + USDHC_INT_STATUS_OFF));
 		return -2;
 	}
 	writel(IRQSTAT_TC | IRQSTAT_BRR, base + USDHC_INT_STATUS_OFF);
@@ -301,15 +313,20 @@ static int usdhc_read_data_port(u32 base, u32 *w, u32 nwords)
 static int usdhc_write_data_port(u32 base, const u32 *w, u32 nwords)
 {
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BWTEN)) {
+		printf("mmc: wport BWTEN timeout\n");
 		return -1;
 	}
 	for (u32 i = 0; i < nwords; i++) {
 		writel(__builtin_bswap32(w[i]), base + USDHC_DAT_PORT_OFF);
 	}
 	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
+		printf("mmc: wport TC timeout, sts=%08x\n",
+		       readl(base + USDHC_INT_STATUS_OFF));
 		return -2;
 	}
 	if (readl(base + USDHC_INT_STATUS_OFF) & (IRQSTAT_DTOE | IRQSTAT_CCE)) {
+		printf("mmc: wport data err, sts=%08x\n",
+		       readl(base + USDHC_INT_STATUS_OFF));
 		return -2;
 	}
 	writel(IRQSTAT_TC | IRQSTAT_BWTEN, base + USDHC_INT_STATUS_OFF);
@@ -328,20 +345,28 @@ static int mmc_wait_card_ready(struct mmc_card *card)
 	int ret;
 
 	for (int to = 0; to < 2000; to++) {
-		ret = usdhc_send_cmd(base, 13, card->rca << 16,
+		/* card->rca 本就是 R6 原始响应 & 0xFFFF0000（= RCA<<16 的
+		 * arg 格式，CMD7/CMD9 同款直传）；再左移一次 = 广播 RCA 0，
+		 * 卡永不响应（2026-11-13 板上实证） */
+		ret = usdhc_send_cmd(base, 13, card->rca,
 				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
 				     XFERTYP_CICEN, 0, &rsp0);
-		if (ret)
+		if (ret) {
+			printf("mmc: CMD13 fail ret=%d\n", ret);
 			return -1;
+		}
 		/* R1 错误位群（规范 5.1；原掩码漏 WP_VIOLATION bit26——
 		 * 烧录场景最相关的一位）。先查错再查就绪：卡拒绝写入
 		 * （如写保护）时常同时置 WP_VIOLATION+READY_FOR_DATA，
 		 * 顺序反了会把失败当成功（第四轮评审 M5） */
-		if (rsp0 & 0xFFF98000U)
+		if (rsp0 & 0xFFF98000U) {
+			printf("mmc: card status err %08x\n", rsp0);
 			return -2;
+		}
 		if (rsp0 & BIT(8))		/* READY_FOR_DATA */
 			return 0;
 	}
+	printf("mmc: card not ready (CMD13 timeout)\n");
 	return -1;
 }
 
@@ -665,7 +690,7 @@ int emmc_init(struct mmc_card *card)
 	 * 同款（R1 + BRR 收 512B，bswap 归一后 w[53] 即 SEC_COUNT）。
 	 */
 	writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
-	ret = usdhc_send_cmd(base, 8, card->rca << 16,
+	ret = usdhc_send_cmd(base, 8, card->rca,	/* 已是 arg 格式，勿再移 */
 			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
 			     XFERTYP_CICEN | XFERTYP_DPSEL,
 			     MIX_CTRL_BCEN | MIX_CTRL_DTDSEL_READ, &r);
@@ -750,6 +775,8 @@ int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
 				     MIX_CTRL_BCEN,		/* DTDSEL=0 写方向 */
 				     NULL);
 		if (ret) {
+			printf("mmc: CMD24 fail lba=%u ret=%d\n", lba + i,
+			       ret);
 			return -1;
 		}
 		if (usdhc_write_data_port(base, p, MMC_BLOCK_SIZE / 4)) {

@@ -247,6 +247,8 @@ static void handle_wdata(u32 len)
 		werr = 1;			/* 短包：按错收处理，等 host 收 DONE */
 		blocks_left = 0;
 	} else if (blocks && src->write(cur_lba, blocks, data_buf, 0)) {
+		printf("usbdl: media write err lba=%u blocks=%u\n", cur_lba,
+		       blocks);
 		werr = 2;
 		blocks_left = 0;
 	} else {
