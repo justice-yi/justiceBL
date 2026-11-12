@@ -59,13 +59,16 @@
 #define USBMODE_SLOM		BIT(3)		/* 关 setup 锁存，改用 SUTW tripwire（RM 56.4.6.4.2.1 推荐方案） */
 /* DEVICEADDR（56.6.23） */
 #define DEVICEADDR_USBADRA	BIT(24)		/* 地址暂存：状态阶段 ZLP 发完才生效（合规范） */
-/* ENDPTCTRL(n)（56.6.39）：RXS(0) RXT[3:2] RXE(7) | TXS(16) TXT[19:18] TXE(23) */
+/* ENDPTCTRL(n)（56.6.39）：RXS(0) RXT[3:2] RXR(6) RXE(7) |
+ *			   TXS(16) TXT[19:18] TXR(22) TXE(23) */
 #define EPCTRL_RXS		BIT(0)
 #define EPCTRL_RXT_CTRL		(0x0 << 2)
+#define EPCTRL_RXR		BIT(6)		/* 数据翻转复位（写 1 一次性） */
 #define EPCTRL_RXE		BIT(7)
 #define EPCTRL_TXS		BIT(16)
 #define EPCTRL_TXT_CTRL		(0x0 << 18)
 #define EPCTRL_TXE		BIT(23)
+#define EPCTRL_TXR		BIT(22)		/* 数据翻转复位（写 1 一次性） */
 #define EPCTRL_TXT_BULK		(0x2 << 18)
 #define EPCTRL_RXT_BULK		(0x2 << 2)
 /* prime/flush/complete：RX 位 = 端点号，TX 位 = 16+端点号 */
@@ -115,7 +118,8 @@ static struct usb_dtd dtd[4] __attribute__((aligned(32)));	/* 与 qh 同序的 d
 
 static u8 dev_addr;		/* 当前 USB 设备地址（总线复位归 0） */
 static u32 primed_len[4];	/* 各方向 prime 的字节数（rx_len 反推实收用） */
-static u32 eng_rst_cnt;		/* 总线复位事件计数（协议层自愈用） */
+static u32 eng_rst_cnt;		/* 链路态代际计数：总线复位/EP1 flush 均
+				 * +1，协议层凭"变了"丢弃状态自愈 */
 static u32 eng_xfer_err;	/* 上一次传输的 dTD 错误位（M1） */
 static u32 ep1_sw_halt;		/* host SET_FEATURE(ENDPOINT_HALT) 请求的 halt：
 				 * 置位期间 poll 自愈不得清除（评审 M2） */
@@ -252,8 +256,12 @@ u32 eng_reset_count(void)
 	return eng_rst_cnt;
 }
 
-/* EP1 双向 FLUSH：清挂起 dTD 并复位 data toggle（RM 56.4.6.4.4），
- * 有界等待；清 stall 位前必须 flush，否则残留 dTD 与后续 prime 竞态 */
+/* EP1 双向 FLUSH：清挂起 dTD 并复位 data toggle（RM 56.4.6.4.4；被冲
+ * 掉的传输不产生完成位），有界等待；清 stall 位前必须 flush，否则残留
+ * dTD 与后续 prime 竞态。
+ * 任何 flush 都会作废协议层已武装的 RX——这里递增代际计数广播"链路态
+ * 变了"，usbdl 凭计数变化丢弃 rx_armed/进行中状态并重 arm（否则武装
+ * 已失、完成位永不来，主机侧 10s NAK 超时，2026-11-12 实测） */
 static void ep1_flush(void)
 {
 	u32 bits = EPBIT(USB_BULK_EP, 0) | EPBIT(USB_BULK_EP, 1);
@@ -262,6 +270,7 @@ static void ep1_flush(void)
 	usbd_soc_wr32(R_ENDPTFLUSH, bits);
 	while ((usbd_soc_rd32(R_ENDPTFLUSH) & bits) && --to)
 		;
+	eng_rst_cnt++;
 }
 
 /* 清 EP1 双向 stall 位，返回清除的位 */
@@ -320,6 +329,24 @@ u32 eng_ep1_halt_bits(void)
 	if (c & EPCTRL_TXS)
 		bits |= 2;
 	return bits;
+}
+
+/*
+ * 使能 EP1 双向 bulk。**规范时机 = 进入 Configured 态（SET_CONFIG，
+ * RM 56.4.6.2），由 ep0_handle_setup 调用**；总线复位会禁用除 EP0 外
+ * 全部端点（RM 56.4.6.2.1），且禁用动作发生在复位结束/速度判定时——
+ * URI 置位瞬间（bus_reset 里）写的使能会被它覆盖，这就是真机
+ * LIBUSB_ERROR_PIPE 首包即挂的根因（2026-11-11 板上两轮实证：枚举
+ * 正常、EP1 首包 STALL、stall 探针无声——禁用端点不置 stall 位）。
+ * U-Boot ci_udc（ep_enable 挂 SET_CONFIG/set_alt 路径）/Linux
+ * chipidea 同款。RXR/TXR 数据翻转复位位按 U-Boot ep_enable 同款带上
+ * （ci_udc.c:330）。
+ */
+static void ep1_bulk_enable(void)
+{
+	usbd_soc_wr32(R_ENDPTCTRL0 + 4 * USB_BULK_EP,
+		      EPCTRL_RXT_BULK | EPCTRL_RXE | EPCTRL_RXR |
+		      EPCTRL_TXT_BULK | EPCTRL_TXE | EPCTRL_TXR);
 }
 
 /* ---- EP0 处理 ---- */
@@ -443,6 +470,20 @@ static void ep0_handle_setup(void)
 			usbd_soc_wr32(R_DEVICEADDR, DEVICEADDR_USBADRA | ((u32)a << 25));
 			dev_addr = a;
 		}
+		/* 端点使能的规范时机 = 进入 Configured 态（RM 56.4.6.2：
+		 * "Entry into the Configured indicates that all endpoints ...
+		 * have been properly initialized by programming the
+		 * USB_UOG_ENDPTCTRLx registers"）。总线复位结束时硬件才禁用
+		 * 非 EP0 端点（56.4.6.2.1），bus_reset() 里 URI 瞬间写的使能
+		 * 会被它覆盖（22:30/22:55 两轮板上实证：首包 PIPE、stall 探针
+		 * 无声）。U-Boot ci_udc 的 ep_enable 同挂 SET_CONFIG 路径 */
+		if (s.bRequest == USB_REQ_SET_CONFIGURATION &&
+		    (s.wValue & 0xFF) == 1) {
+			ep1_flush();		/* 清挂起 dTD + data toggle 复位；
+						 * 冲掉的武装由 ep1_flush 的
+						 * 代际递增通知协议层重 arm */
+			ep1_bulk_enable();
+		}
 		ep0_status_in();
 		break;
 
@@ -488,6 +529,8 @@ static void bus_reset(void)
 	}
 
 	qh_reinit();					/* dQH 归零：解除一切挂起 */
+	ep1_bulk_enable();	/* 防御性：复位结束时的硬件禁用会覆盖此写入，
+				 * 真正生效的使能在 SET_CONFIG（ep0_handle_setup） */
 	primed_len[0] = primed_len[1] = primed_len[2] = primed_len[3] = 0;
 	eng_rst_cnt++;					/* 协议层感知复位、自愈状态机 */
 	usbd_soc_wr32(R_ENDPTSETUPSTAT, 1);		/* W1C 清残留标志 */
@@ -523,9 +566,9 @@ static int usbd_hw_init(void)
 	usbd_soc_wr32(R_ENDPTLISTADDR, (u32)qh);
 
 	/* EP0：RM 56.4.6.1 明言免配 ENDPTCTRL0（复位值 0080_0080 已使能收发、类型固定） */
-	/* EP1 bulk：RM Table 56-65——type=10 且上下半一致，RXE/TXE 使能 */
-	usbd_soc_wr32(R_ENDPTCTRL0 + 4 * USB_BULK_EP,
-		      EPCTRL_RXT_BULK | EPCTRL_RXE | EPCTRL_TXT_BULK | EPCTRL_TXE);
+	/* EP1 bulk：RM Table 56-65——type=10 且上下半一致，RXE/TXE 使能。
+	 * 总线复位后此处失效；生效的使能在 SET_CONFIG（见 ep1_bulk_enable 注释） */
+	ep1_bulk_enable();
 
 	/* 轮询模式：中断全屏蔽（RM 步骤 4 的替代实现） */
 	usbd_soc_wr32(R_USBINTR, 0);
