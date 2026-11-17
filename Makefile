@@ -33,6 +33,7 @@ OBJS := $(BUILD)/start.o \
 	$(BUILD)/boot.o \
 	$(BUILD)/drivers/uart.o \
 	$(BUILD)/drivers/led.o \
+	$(BUILD)/drivers/key.o \
 	$(BUILD)/drivers/mmc.o \
 	$(BUILD)/drivers/bootdev.o \
 	$(BUILD)/drivers/board.o \
