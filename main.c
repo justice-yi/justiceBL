@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 /*
- * justiceBL 主流程 v0.14 —— 纯编排，无寄存器操作（架构规矩见
+ * justiceBL 主流程 v0.15 —— 纯编排，无寄存器操作（架构规矩见
  * ~/.zcode/AGENTS.md 与 docs/CODING_STYLE.md）。
  *
  * 职责划分：
- *   board    "拨电路"：板级早期初始化（拆看门狗→断电链，board.c）
+ *   board    "拨电路"：板级早期初始化（看门狗签名=三只狗掉电计数器清零，board.c）
  *   bootmode "回哪去"：消费 reboot-mode 魔数，loader -> USB 下载（bootmode.c）
  *   bootdev  "从哪来"：SRC 寄存器识别 -> 返回块源（SD/eMMC 现役，
  *            USB/UART 预留位）
