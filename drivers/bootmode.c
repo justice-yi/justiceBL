@@ -22,12 +22,12 @@
 
 void bootmode_dispatch(void)
 {
-	u32 flag = readl(MX6ULL_SNVS_LP_BASE + MX6ULL_SNVS_LPGPR_OFF);
+	u32 flag = readl(SNVS_LPGPR);
 
 	if (flag != REBOOT_MAGIC_LOADER)
 		return;				/* NORM/RCOV/0/垃圾：放行 */
 
-	writel(0, MX6ULL_SNVS_LP_BASE + MX6ULL_SNVS_LPGPR_OFF);
+	writel(0, SNVS_LPGPR);
 	printf("bootmode: loader caught, cleared\n");
 	usbd_download_mode();			/* 不返回 */
 }

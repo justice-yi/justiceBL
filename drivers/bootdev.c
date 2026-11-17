@@ -16,8 +16,6 @@
 #include <bootdev.h>
 #include <stddef.h>
 
-#define SRC_SBMR1		(MX6ULL_SRC_BASE + 0x04)
-
 /* 预留桩：接口占位，未实现 */
 const struct block_source usb_source = {
 	.name = "USB (reserved for flashtool SDP)",

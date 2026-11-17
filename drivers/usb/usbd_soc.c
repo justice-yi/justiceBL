@@ -2,7 +2,8 @@
 /*
  * USB 设备控制器的 SoC 专属层（i.MX6ULL / ChipIdea IP）。
  *
- * 本文件集中所有 i.MX 具体地址与上电顺序，换 SoC 时只改这里。
+ * 本文件收纳带时序的 SoC 上电序列（时钟/PHY/LDO）；寄存器地址全部
+ * 在 imx6ull.h 词典（USB1_*、USBPHY1_*、CCM_ANALOG_* 等 RM 名）。
  * 依据（IMX6ULL参考手册 Rev.1 11/2017，下称 RM）：
  *   - 控制器基址：RM 56.5 内存映射，USB OTG1 core = 0x0218_4000，核间距 512
  *   - PLL3：RM 18.7.2 CCM_ANALOG_PLL_USB1 @ 0x020C_8010（USB1 PLL 480MHz）
@@ -18,21 +19,8 @@
 #include <imx6ull.h>
 #include "usbd_soc.h"
 
-/* ---- 地址（RM 出处见文件头） ---- */
-#define USBOH3_OTG1_BASE	0x02184000
-#define CCM_ANALOG_BASE		0x020C8000	/* RM：ANATOP 块基址（PLL_SET/CLR 所在） */
-#define PLL_USB1		0x020C8010	/* RM 18.7.2：CTRL @ base+0x10 */
-#define PLL_USB1_SET_OFF	0x14		/* RM 18.7.2：base+0x14 */
-#define PLL_USB1_CLR_OFF	0x18		/* RM 18.7.2：base+0x18 */
-#define CCM_CCGR6_OFF		0x80		/* RM 18.6.29：CCM base + 0x80 */
-#define USBPHY1_PWD		0x020C9000	/* RM 57.3：PWD @ PHY base+0x00 */
-#define USBPHY1_CTRL_SET	0x020C9034	/* CTRL_SET */
-#define USBPHY1_CTRL_CLR	0x020C9038	/* CTRL_CLR */
-#define PLL_USB2_CLR		0x020C8038	/* RM：PLL_USB2 @ base+0x20，CLR=+0x38 */
-#define PMU_REG_3P0_SET		0x020C8124	/* RM 39.6.2 */
-#define PMU_REG_3P0_CLR		0x020C8128
-#define USBNC_OTG1_BASE		0x02184800	/* RM 56.5.1 */
-#define USB1_CHRG_DETECT	0x020C81B0	/* RM 57.4.2 */
+/* ---- 地址：全部来自 imx6ull.h 词典（RM 名 + 确切实例）；本文件只留
+ * 位段宏与实例映射（usbd.c 的 IP 偏移 → USB1_BASE）。RM 出处见文件头 ---- */
 
 /* PLL_USB1 位（RM 18.7.2 + U-Boot usb_power_config_mx6 同款集合） */
 #define PLL_LOCK		BIT(31)
@@ -73,21 +61,6 @@ static void delay_10us(void)
 		;
 }
 
-u32 usbd_soc_core_base(void)
-{
-	return USBOH3_OTG1_BASE;
-}
-
-u32 usbd_soc_rd32(u32 off)
-{
-	return readl(USBOH3_OTG1_BASE + off);
-}
-
-void usbd_soc_wr32(u32 off, u32 val)
-{
-	writel(val, USBOH3_OTG1_BASE + off);
-}
-
 /*
  * 时钟：PLL3(USB1 PLL) 的 480MHz 输出经 bit6(EN_USB_CLKS) 直达 USBPHY 的
  * UTMI 时钟——bit13(ENABLE) 只是把时钟送进 CCM 给别的模块，两者都要置位。
@@ -102,20 +75,19 @@ int usbd_soc_clock_init(void)
 {
 	u32 to = 1000000;
 
-	writel(PLL_BYPASS, CCM_ANALOG_BASE + PLL_USB1_CLR_OFF);
+	writel(PLL_BYPASS, CCM_ANALOG_PLL_USB1_CLR);
 	writel(PLL_POWER | PLL_ENABLE | PLL_EN_USB_CLKS,
-	       CCM_ANALOG_BASE + PLL_USB1_SET_OFF);
+	       CCM_ANALOG_PLL_USB1_SET);
 
 	/* 等 PLL 锁定（LOCK bit31），超时判失败防止死等 */
-	while (!(readl(PLL_USB1) & PLL_LOCK)) {
+	while (!(readl(CCM_ANALOG_PLL_USB1) & PLL_LOCK)) {
 		if (--to == 0)
 			return -1;
 	}
 
-	writel(readl(MX6ULL_CCM_BASE + CCM_CCGR6_OFF) | CCGR_CG0_MASK,
-	       MX6ULL_CCM_BASE + CCM_CCGR6_OFF);
+	writel(readl(CCM_CCGR6) | CCGR_CG0_MASK, CCM_CCGR6);
 
-	writel(PLL_POWER, PLL_USB2_CLR);	/* 断遗留 PLL_USB2 */
+	writel(PLL_POWER, CCM_ANALOG_PLL_USB2_CLR);	/* 断遗留 PLL_USB2 */
 	return 0;
 }
 
@@ -147,6 +119,6 @@ void usbd_soc_phy_init(void)
 
 	writel(CHRG_EN_B | CHRG_CHK_CHRG_B, USB1_CHRG_DETECT);
 
-	writel(readl(USBNC_OTG1_BASE) | USBNC_OVER_CUR_DIS | USBNC_OVER_CUR_POL,
-	       USBNC_OTG1_BASE);
+	writel(readl(USBNC_OTG1_CTRL) | USBNC_OVER_CUR_DIS | USBNC_OVER_CUR_POL,
+	       USBNC_OTG1_CTRL);
 }

@@ -14,18 +14,7 @@
 #include <imx6ull.h>
 #include <uart.h>
 
-/* i.MX UART 寄存器偏移 */
-#define UTXD_OFF		0x40
-#define UCR1_OFF		0x80
-#define UCR2_OFF		0x84
-#define UCR3_OFF		0x88
-#define UFCR_OFF		0x90
-#define USR2_OFF		0x98
-#define UBIR_OFF		0xA4
-#define UBMR_OFF		0xA8
-#define UART_REG(off)		(MX6ULL_UART1_BASE + (off))
-
-/* 常用位 */
+/* 位段（寄存器地址在 imx6ull.h 词典，RM 名） */
 #define UCR1_UARTEN		BIT(0)
 #define UCR2_SRST		BIT(0)		/* 低有效：0=复位中 1=完成 */
 #define UCR2_RXEN		BIT(1)
@@ -36,16 +25,7 @@
 #define USR2_TXDC		BIT(3)		/* 发送器空 */
 #define UFCR_RFDIV_1		(5 << 7)	/* 参考时钟 1 分频 */
 
-/* IOMUX：UART1_TX/RX 复用 ALT0（偏移与 imx6ul-pinfunc.h 同源） */
-#define MUX_UART1_TX_OFF	0x84
-#define MUX_UART1_RX_OFF	0x88
-#define PAD_UART1_TX_OFF	0x310
-#define PAD_UART1_RX_OFF	0x314
-#define IOMUXC_REG(off)		(MX6ULL_IOMUXC_BASE + (off))
 #define UART_PAD_CONFIG		0x1B0B1		/* 设备树 pinctrl 原值 */
-
-/* CCM：uart1 时钟门控 CCGR5 CG12(bit25:24) */
-#define CCGR5_REG		(MX6ULL_CCM_BASE + 0x7C)
 
 u32 uart_tx_timeouts;
 
@@ -59,28 +39,28 @@ u32 uart_tx_timeouts;
  */
 int uart_init(void)
 {
-	writel(readl(CCGR5_REG) | (3 << 24), CCGR5_REG);
+	writel(readl(CCM_CCGR5) | (3 << 24), CCM_CCGR5);
 
-	writel(0, IOMUXC_REG(MUX_UART1_TX_OFF));
-	writel(UART_PAD_CONFIG, IOMUXC_REG(PAD_UART1_TX_OFF));
-	writel(0, IOMUXC_REG(MUX_UART1_RX_OFF));
-	writel(UART_PAD_CONFIG, IOMUXC_REG(PAD_UART1_RX_OFF));
+	writel(0, IOMUXC_SW_MUX_CTL_PAD_UART1_TX_DATA);
+	writel(UART_PAD_CONFIG, IOMUXC_SW_PAD_CTL_PAD_UART1_TX_DATA);
+	writel(0, IOMUXC_SW_MUX_CTL_PAD_UART1_RX_DATA);
+	writel(UART_PAD_CONFIG, IOMUXC_SW_PAD_CTL_PAD_UART1_RX_DATA);
 
 	/* 软复位：UCR2 写 0 触发（SRST 低有效），等硬件自置 1 = 完成 */
-	writel(0, UART_REG(UCR1_OFF));
-	writel(0, UART_REG(UCR2_OFF));
-	while (!(readl(UART_REG(UCR2_OFF)) & UCR2_SRST)) {
+	writel(0, UART1_UCR1);
+	writel(0, UART1_UCR2);
+	while (!(readl(UART1_UCR2) & UCR2_SRST)) {
 		;
 	}
 
-	writel(UFCR_RFDIV_1, UART_REG(UFCR_OFF));
-	writel(71, UART_REG(UBIR_OFF));
-	writel(3124, UART_REG(UBMR_OFF));
+	writel(UFCR_RFDIV_1, UART1_UFCR);
+	writel(71, UART1_UBIR);
+	writel(3124, UART1_UBMR);
 
 	writel(UCR2_IRTS | UCR2_WS | UCR2_TXEN | UCR2_RXEN | UCR2_SRST,
-	       UART_REG(UCR2_OFF));
-	writel(readl(UART_REG(UCR3_OFF)) | UCR3_RXDMUXSEL, UART_REG(UCR3_OFF));
-	writel(UCR1_UARTEN, UART_REG(UCR1_OFF));
+	       UART1_UCR2);
+	writel(readl(UART1_UCR3) | UCR3_RXDMUXSEL, UART1_UCR3);
+	writel(UCR1_UARTEN, UART1_UCR1);
 
 	return 0;
 }
@@ -96,13 +76,13 @@ void uart_putc(char c)
 {
 	u32 t = 5000000;
 
-	while (!(readl(UART_REG(USR2_OFF)) & USR2_TXDC) && --t) {
+	while (!(readl(UART1_USR2) & USR2_TXDC) && --t) {
 		;
 	}
 	if (!t) {
 		uart_tx_timeouts++;
 	}
-	writel((u8)c, UART_REG(UTXD_OFF));
+	writel((u8)c, UART1_UTXD);
 }
 
 /**

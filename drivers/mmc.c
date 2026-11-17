@@ -28,27 +28,70 @@
 #include <printf.h>
 #include <blocksrc.h>
 
-/* ---- USDHC 寄存器偏移（USDHC_Type）---- */
-#define USDHC_DS_ADDR_OFF	0x00
-#define USDHC_BLK_ATT_OFF	0x04
-#define USDHC_CMD_ARG_OFF	0x08
-#define USDHC_CMD_XFR_OFF	0x0C
-#define USDHC_RSP0_OFF		0x10
-#define USDHC_DAT_PORT_OFF	0x20
-#define USDHC_PRES_STATE_OFF	0x24
-#define USDHC_PROT_CTRL_OFF	0x28
-#define USDHC_SYS_CTRL_OFF	0x2C
-#define USDHC_INT_STATUS_OFF	0x30
-#define USDHC_INT_EN_OFF	0x34
-#define USDHC_SIG_EN_OFF	0x38
+/* ---- USDHC 寄存器：地址在 imx6ull.h 词典（RM 58 章 USDHC1_/USDHC2_
+ * 确切实例）。双实例同构，此处用同构地址表按卡选用，字段名 = RM 寄存
+ * 名小写 ---- */
+struct usdhc_map {
+	u32 blk_att;
+	u32 cmd_arg;
+	u32 cmd_xfr_typ;
+	u32 cmd_rsp0;		/* RSP1-3 = cmd_rsp0 + i*4（连续） */
+	u32 data_buff_acc_port;
+	u32 pres_state;
+	u32 prot_ctrl;
+	u32 sys_ctrl;
+	u32 int_status;
+	u32 int_status_en;
+	u32 int_signal_en;
+	u32 wtmk_lvl;
+	u32 mix_ctrl;
+	u32 vend_spec;
+};
+
+static const struct usdhc_map usdhc1_map = {
+	.blk_att		= USDHC1_BLK_ATT,
+	.cmd_arg		= USDHC1_CMD_ARG,
+	.cmd_xfr_typ		= USDHC1_CMD_XFR_TYP,
+	.cmd_rsp0		= USDHC1_CMD_RSP0,
+	.data_buff_acc_port	= USDHC1_DATA_BUFF_ACC_PORT,
+	.pres_state		= USDHC1_PRES_STATE,
+	.prot_ctrl		= USDHC1_PROT_CTRL,
+	.sys_ctrl		= USDHC1_SYS_CTRL,
+	.int_status		= USDHC1_INT_STATUS,
+	.int_status_en		= USDHC1_INT_STATUS_EN,
+	.int_signal_en		= USDHC1_INT_SIGNAL_EN,
+	.wtmk_lvl		= USDHC1_WTMK_LVL,
+	.mix_ctrl		= USDHC1_MIX_CTRL,
+	.vend_spec		= USDHC1_VEND_SPEC,
+};
+
+static const struct usdhc_map usdhc2_map = {
+	.blk_att		= USDHC2_BLK_ATT,
+	.cmd_arg		= USDHC2_CMD_ARG,
+	.cmd_xfr_typ		= USDHC2_CMD_XFR_TYP,
+	.cmd_rsp0		= USDHC2_CMD_RSP0,
+	.data_buff_acc_port	= USDHC2_DATA_BUFF_ACC_PORT,
+	.pres_state		= USDHC2_PRES_STATE,
+	.prot_ctrl		= USDHC2_PROT_CTRL,
+	.sys_ctrl		= USDHC2_SYS_CTRL,
+	.int_status		= USDHC2_INT_STATUS,
+	.int_status_en		= USDHC2_INT_STATUS_EN,
+	.int_signal_en		= USDHC2_INT_SIGNAL_EN,
+	.wtmk_lvl		= USDHC2_WTMK_LVL,
+	.mix_ctrl		= USDHC2_MIX_CTRL,
+	.vend_spec		= USDHC2_VEND_SPEC,
+};
+
+/* 按实例基址取同构地址表 */
+static const struct usdhc_map *usdhc_map_get(u32 base)
+{
+	return base == USDHC1_BASE ? &usdhc1_map : &usdhc2_map;
+}
 
 /* INT_STATUS_EN：bit0-5 正常事件(CC/TC/BGE/DINT/BWR/BRR)，bit16-22 错误事件
  * (CTOE/CCE/CEBE/CIE/DTOE/DCE/DEBE)——错误位必须开，轮询判错才成立 */
 #define IRQEN_NORMAL		0x0000003FU
 #define IRQEN_ERRORS		0x007F0000U
-#define USDHC_HOST_CAP_OFF	0x40
-#define USDHC_MIX_CTRL_OFF	0x48
-#define USDHC_VEND_SPEC_OFF	0xC0
 
 /* ---- 位定义（值与 U-Boot fsl_esdhc_imx.h 一致）---- */
 #define IRQSTAT_CC		BIT(0)
@@ -82,57 +125,70 @@
 #define XFERTYP_CICEN		BIT(20)
 #define XFERTYP_DPSEL		BIT(21)
 #define MIX_CTRL_BCEN		BIT(1)
+#define MIX_CTRL_AC12EN		BIT(2)		/* 多块自动 CMD12（单块被硬件忽略） */
 #define MIX_CTRL_DTDSEL_READ	BIT(4)
+#define MIX_CTRL_MSBSEL		BIT(5)		/* 多块选择（CMD18/25 用） */
 
-#define USDHC1_BASE		0x02190000
-#define USDHC2_BASE		0x02194000
-#define CCGR6_REG		(MX6ULL_CCM_BASE + 0x80)
+#define USDHC_FIFO_WORDS	128		/* RM 58.4.1.2：缓冲 128 字深 */
 
 #define MMC_BLOCK_SIZE		512
 #define WAIT_LOOPS		2000000U	/* 有界等待上限，约百毫秒级 */
 
-/* ---- 板级引脚（偏移源自 imx6ul-pinfunc.h，pad 值源自 alientek dts）---- */
+/* ---- 板级引脚（IOMUXC 寄存器地址在 imx6ull.h 词典，RM 名；
+ * mux 模式/pad 值源自 kernel dts imx6ul-pinfunc.h + alientek dts）---- */
 struct pin_cfg {
-	u16 mux_off;
-	u16 pad_off;
+	u32 mux_reg;		/* IOMUXC_SW_MUX_CTL_PAD_xxx（词典绝对地址） */
+	u32 pad_reg;		/* IOMUXC_SW_PAD_CTL_PAD_xxx */
 	u8 mux_mode;
 	u32 pad_val;
 };
 
 static const struct pin_cfg sd1_pins[] = {	/* TF 卡，USDHC1 */
-	{ 0x01C0, 0x044C, 0, 0x10071 },		/* SD1_CLK */
-	{ 0x01BC, 0x0448, 0, 0x17059 },		/* SD1_CMD */
-	{ 0x01C4, 0x0450, 0, 0x17059 },		/* SD1_DATA0 */
-	{ 0x01C8, 0x0454, 0, 0x17059 },		/* SD1_DATA1 */
-	{ 0x01CC, 0x0458, 0, 0x17059 },		/* SD1_DATA2 */
-	{ 0x01D0, 0x045C, 0, 0x17059 },		/* SD1_DATA3 */
+	{ IOMUXC_SW_MUX_CTL_PAD_SD1_CLK, IOMUXC_SW_PAD_CTL_PAD_SD1_CLK,
+	  0, 0x10071 },
+	{ IOMUXC_SW_MUX_CTL_PAD_SD1_CMD, IOMUXC_SW_PAD_CTL_PAD_SD1_CMD,
+	  0, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_SD1_DATA0, IOMUXC_SW_PAD_CTL_PAD_SD1_DATA0,
+	  0, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_SD1_DATA1, IOMUXC_SW_PAD_CTL_PAD_SD1_DATA1,
+	  0, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_SD1_DATA2, IOMUXC_SW_PAD_CTL_PAD_SD1_DATA2,
+	  0, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_SD1_DATA3, IOMUXC_SW_PAD_CTL_PAD_SD1_DATA3,
+	  0, 0x17059 },
 };
 
 static const struct pin_cfg emmc_pins[] = {	/* eMMC，USDHC2（NAND 复用脚）*/
-	{ 0x0178, 0x0404, 1, 0x10069 },		/* NAND_RE_B -> CLK */
-	{ 0x017C, 0x0408, 1, 0x17059 },		/* NAND_WE_B -> CMD */
-	{ 0x0180, 0x040C, 1, 0x17059 },		/* DATA0 */
-	{ 0x0184, 0x0410, 1, 0x17059 },		/* DATA1 */
-	{ 0x0188, 0x0414, 1, 0x17059 },		/* DATA2 */
-	{ 0x018C, 0x0418, 1, 0x17059 },		/* DATA3 */
+	{ IOMUXC_SW_MUX_CTL_PAD_NAND_RE_B, IOMUXC_SW_PAD_CTL_PAD_NAND_RE_B,
+	  1, 0x10069 },					/* ALT1 = USDHC2_CLK */
+	{ IOMUXC_SW_MUX_CTL_PAD_NAND_WE_B, IOMUXC_SW_PAD_CTL_PAD_NAND_WE_B,
+	  1, 0x17059 },					/* ALT1 = USDHC2_CMD */
+	{ IOMUXC_SW_MUX_CTL_PAD_NAND_DATA00, IOMUXC_SW_PAD_CTL_PAD_NAND_DATA00,
+	  1, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_NAND_DATA01, IOMUXC_SW_PAD_CTL_PAD_NAND_DATA01,
+	  1, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_NAND_DATA02, IOMUXC_SW_PAD_CTL_PAD_NAND_DATA02,
+	  1, 0x17059 },
+	{ IOMUXC_SW_MUX_CTL_PAD_NAND_DATA03, IOMUXC_SW_PAD_CTL_PAD_NAND_DATA03,
+	  1, 0x17059 },
 };
 
 static void pins_setup(const struct pin_cfg *pins, u32 n)
 {
 	for (u32 i = 0; i < n; i++) {
-		writel(pins[i].mux_mode, MX6ULL_IOMUXC_BASE + pins[i].mux_off);
-		writel(pins[i].pad_val, MX6ULL_IOMUXC_BASE + pins[i].pad_off);
+		writel(pins[i].mux_mode, pins[i].mux_reg);
+		writel(pins[i].pad_val, pins[i].pad_reg);
 	}
 }
 
 /* ---- 主机层 ---- */
 
 /** 等寄存器某些位变 0/变 1，有界；1=等到，0=超时 */
-static int usdhc_wait_clear(u32 base, u32 off, u32 mask)
+static int usdhc_wait_clear(u32 reg, u32 mask)
 {
 	u32 t = WAIT_LOOPS;
 
-	while (readl(base + off) & mask) {
+	while (readl(reg) & mask) {
 		if (!--t) {
 			return 0;
 		}
@@ -140,11 +196,11 @@ static int usdhc_wait_clear(u32 base, u32 off, u32 mask)
 	return 1;
 }
 
-static int usdhc_wait_set(u32 base, u32 off, u32 mask)
+static int usdhc_wait_set(u32 reg, u32 mask)
 {
 	u32 t = WAIT_LOOPS;
 
-	while (!(readl(base + off) & mask)) {
+	while (!(readl(reg) & mask)) {
 		if (!--t) {
 			return 0;
 		}
@@ -162,9 +218,9 @@ static int usdhc_wait_set(u32 base, u32 off, u32 mask)
 static u32 usdhc_base_clock_mhz(u32 base)
 {
 	u32 is_usdhc1 = (base == USDHC1_BASE);
-	u32 sel = (readl(MX6ULL_CCM_BASE + 0x1C) >>
+	u32 sel = (readl(CCM_CSCMR1) >>
 		   (is_usdhc1 ? 16 : 17)) & 1;
-	u32 podf = ((readl(MX6ULL_CCM_BASE + 0x24) >>
+	u32 podf = ((readl(CCM_CSCDR1) >>
 		     (is_usdhc1 ? 11 : 16)) & 7) + 1;
 
 	return udiv32(sel ? 352 : 396, podf);
@@ -183,6 +239,7 @@ static u32 usdhc_base_clock_mhz(u32 base)
  */
 static int usdhc_set_clock(u32 base, u32 target_hz)
 {
+	const struct usdhc_map *m = usdhc_map_get(base);
 	u32 base_hz = usdhc_base_clock_mhz(base) * 1000000U;
 	u32 dvs, fs, fsdiv;
 
@@ -199,48 +256,54 @@ static int usdhc_set_clock(u32 base, u32 target_hz)
 	fsdiv = 256;
 found:
 	fs = fsdiv >> 1;		/* 字段值 = 档位/2，0 即 ÷1 */
-	writel(readl(base + USDHC_VEND_SPEC_OFF) & ~VENDORSPEC_CKEN,
-	       base + USDHC_VEND_SPEC_OFF);
-	writel((readl(base + USDHC_SYS_CTRL_OFF) & ~0x0000FFF0U) |
-	       (fs << 8) | (dvs << 4), base + USDHC_SYS_CTRL_OFF);
-	if (!usdhc_wait_set(base, USDHC_PRES_STATE_OFF, PRSSTAT_SDSTB)) {
+	writel(readl(m->vend_spec) & ~VENDORSPEC_CKEN,
+	       m->vend_spec);
+	writel((readl(m->sys_ctrl) & ~0x0000FFF0U) |
+	       (fs << 8) | (dvs << 4), m->sys_ctrl);
+	if (!usdhc_wait_set(m->pres_state, PRSSTAT_SDSTB)) {
 		return -1;
 	}
-	writel(readl(base + USDHC_VEND_SPEC_OFF) | VENDORSPEC_CKEN,
-	       base + USDHC_VEND_SPEC_OFF);
+	writel(readl(m->vend_spec) | VENDORSPEC_CKEN,
+	       m->vend_spec);
 	return (int)udiv32(base_hz, (dvs + 1) * fsdiv);
 }
 
 /** 主机复位 + 通用初始化（U-Boot fsl_esdhc_init 同套路）*/
 static int usdhc_hw_init(u32 base)
 {
-	writel(readl(base + USDHC_SYS_CTRL_OFF) |
+	const struct usdhc_map *m = usdhc_map_get(base);
+
+	writel(readl(m->sys_ctrl) |
 	       SYSCTL_RSTA | SYSCTL_RSTC | SYSCTL_RSTD,
-	       base + USDHC_SYS_CTRL_OFF);
-	if (!usdhc_wait_clear(base, USDHC_SYS_CTRL_OFF,
+	       m->sys_ctrl);
+	if (!usdhc_wait_clear(m->sys_ctrl,
 			      SYSCTL_RSTA | SYSCTL_RSTC | SYSCTL_RSTD)) {
 		return -1;
 	}
 
-	writel(0, base + USDHC_MIX_CTRL_OFF);
-	writel(VENDORSPEC_INIT, base + USDHC_VEND_SPEC_OFF);
-	writel(readl(base + USDHC_VEND_SPEC_OFF) |
+	writel(0, m->mix_ctrl);
+	writel(VENDORSPEC_INIT, m->vend_spec);
+	writel(readl(m->vend_spec) |
 	       VENDORSPEC_HCKEN | VENDORSPEC_IPGEN,
-	       base + USDHC_VEND_SPEC_OFF);
+	       m->vend_spec);
 
 	/* 发 80 个初始化时钟（INITA 自清）*/
-	writel(readl(base + USDHC_SYS_CTRL_OFF) | SYSCTL_INITA,
-	       base + USDHC_SYS_CTRL_OFF);
-	if (!usdhc_wait_clear(base, USDHC_SYS_CTRL_OFF, SYSCTL_INITA)) {
+	writel(readl(m->sys_ctrl) | SYSCTL_INITA,
+	       m->sys_ctrl);
+	if (!usdhc_wait_clear(m->sys_ctrl, SYSCTL_INITA)) {
 		return -1;
 	}
 
 	/* 状态使能开正常+错误事件；信号使能显式清 0（不依赖复位默认）——纯轮询 */
-	writel(IRQEN_NORMAL | IRQEN_ERRORS, base + USDHC_INT_EN_OFF);
-	writel(0, base + USDHC_SIG_EN_OFF);
-	writel(0xFFFFFFFF, base + USDHC_INT_STATUS_OFF);/* 写 1 清中断状态历史 */
-	writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);/* 块长 512，count 占位 */
-	writel(0x00000008, base + USDHC_PROT_CTRL_OFF);	/* 1 位总线 + 大端数据口 */
+	writel(IRQEN_NORMAL | IRQEN_ERRORS, m->int_status_en);
+	writel(0, m->int_signal_en);
+	writel(0xFFFFFFFF, m->int_status);/* 写 1 清中断状态历史 */
+	/* WML 水位 128/128（复位默认 16/16）：PIO 分段吞吐的前提——
+	 * 每段拉满/推满 FIFO 深度（RM 58.4.1.2：buffer 128 words） */
+	writel((readl(m->wtmk_lvl) & ~0x00FF00FFU) | 0x00800080U,
+	       m->wtmk_lvl);
+	writel((1 << 16) | MMC_BLOCK_SIZE, m->blk_att);/* 块长 512，count 占位 */
+	writel(0x00000008, m->prot_ctrl);	/* 1 位总线 + 大端数据口 */
 	if (usdhc_set_clock(base, 400000) < 0) {
 		return -2;
 	}
@@ -258,78 +321,105 @@ static int usdhc_hw_init(u32 base)
 static int usdhc_send_cmd(u32 base, u8 idx, u32 arg, u32 xfr_hi, u32 mix_lo,
 			  u32 *rsp0)
 {
-	if (!usdhc_wait_clear(base, USDHC_PRES_STATE_OFF,
+	const struct usdhc_map *m = usdhc_map_get(base);
+
+	if (!usdhc_wait_clear(m->pres_state,
 			      PSTATE_CIHB | PSTATE_CIDHB | PSTATE_DLA)) {
 		return -1;	/* 总线未空闲：命令/数据 inhibit 或数据线忙 */
 	}
-	writel(0xFFFFFFFF, base + USDHC_INT_STATUS_OFF);
-	writel(arg, base + USDHC_CMD_ARG_OFF);
-	writel((readl(base + USDHC_MIX_CTRL_OFF) & 0xFFFFFF80U) | mix_lo,
-	       base + USDHC_MIX_CTRL_OFF);
-	writel(((u32)idx << 24) | xfr_hi, base + USDHC_CMD_XFR_OFF);
+	writel(0xFFFFFFFF, m->int_status);
+	writel(arg, m->cmd_arg);
+	writel((readl(m->mix_ctrl) & 0xFFFFFF80U) | mix_lo,
+	       m->mix_ctrl);
+	writel(((u32)idx << 24) | xfr_hi, m->cmd_xfr_typ);
 
-	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_CC)) {
+	if (!usdhc_wait_set(m->int_status, IRQSTAT_CC)) {
 		return -1;
 	}
-	if (readl(base + USDHC_INT_STATUS_OFF) &
+	if (readl(m->int_status) &
 	    (IRQSTAT_CTOE | IRQSTAT_CCE)) {
 		return -2;
 	}
 	if (rsp0) {
-		*rsp0 = readl(base + USDHC_RSP0_OFF);
+		*rsp0 = readl(m->cmd_rsp0);
 	}
 	return 0;
 }
 
 /** 从数据口收 nwords 个字到 buf（PIO，BRR 轮询；块长/块数由调用方设）*/
+/* PIO 收流：分段等 BRR 拉 FIFO（128 字深，WML=128 时每段满窗），全部
+ * 收完等 TC。单块（CMD17/CMD6/EXT_CSD）与多块（CMD18）通用——块数由
+ * BLK_ATT 决定，本函数只管把 nwords 收完。
+ * 数据端口是大端语义（板上实测 v0.5 MISMATCH → swab32 全匹配确诊），
+ * ARM 小端内存需在驱动边界归一化。 */
 static int usdhc_read_data_port(u32 base, u32 *w, u32 nwords)
 {
-	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BRR)) {
-		printf("mmc: rport BRR timeout\n");
-		return -1;
+	const struct usdhc_map *m = usdhc_map_get(base);
+	u32 *p = w;
+
+	while (nwords) {
+		u32 take = nwords;
+
+		if (!usdhc_wait_set(m->int_status, IRQSTAT_BRR)) {
+			printf("mmc: rport BRR timeout\n");
+			return -1;
+		}
+		if (take > USDHC_FIFO_WORDS)
+			take = USDHC_FIFO_WORDS;
+		for (u32 i = 0; i < take; i++) {
+			*p++ = __builtin_bswap32(readl(m->data_buff_acc_port));
+		}
+		nwords -= take;
 	}
-	/* 数据端口是大端语义（板上实测 v0.5 MISMATCH → swab32 全匹配确诊），
-	 * ARM 小端内存需在驱动边界归一化；将来写路径同样要 bswap */
-	for (u32 i = 0; i < nwords; i++) {
-		w[i] = __builtin_bswap32(readl(base + USDHC_DAT_PORT_OFF));
-	}
-	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
+	if (!usdhc_wait_set(m->int_status, IRQSTAT_TC)) {
 		printf("mmc: rport TC timeout, sts=%08x\n",
-		       readl(base + USDHC_INT_STATUS_OFF));
+		       readl(m->int_status));
 		return -2;
 	}
-	if (readl(base + USDHC_INT_STATUS_OFF) &
+	if (readl(m->int_status) &
 	    (IRQSTAT_DTOE | IRQSTAT_CCE)) {
 		printf("mmc: rport data err, sts=%08x\n",
-		       readl(base + USDHC_INT_STATUS_OFF));
+		       readl(m->int_status));
 		return -2;
 	}
-	writel(IRQSTAT_TC | IRQSTAT_BRR, base + USDHC_INT_STATUS_OFF);
+	writel(IRQSTAT_TC | IRQSTAT_BRR, m->int_status);
 	return 0;
 }
 
 /** 向数据口发 nwords 个字（PIO，BWTEN 轮询；块长/块数由调用方设）。
  * 字节序与读路径同款：数据口大端语义，写入前 swab */
+/* PIO 推流：分段等 BWTEN 推 FIFO（卡编程忙时 DAT0 反压，硬件自动停发，
+ * BWTEN 掉了就等），全部推完等 TC。单块（CMD24）与多块（CMD25）通用。 */
 static int usdhc_write_data_port(u32 base, const u32 *w, u32 nwords)
 {
-	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_BWTEN)) {
-		printf("mmc: wport BWTEN timeout\n");
-		return -1;
+	const struct usdhc_map *m = usdhc_map_get(base);
+	const u32 *p = w;
+
+	while (nwords) {
+		u32 take = nwords;
+
+		if (!usdhc_wait_set(m->int_status, IRQSTAT_BWTEN)) {
+			printf("mmc: wport BWTEN timeout\n");
+			return -1;
+		}
+		if (take > USDHC_FIFO_WORDS)
+			take = USDHC_FIFO_WORDS;
+		for (u32 i = 0; i < take; i++) {
+			writel(__builtin_bswap32(*p++), m->data_buff_acc_port);
+		}
+		nwords -= take;
 	}
-	for (u32 i = 0; i < nwords; i++) {
-		writel(__builtin_bswap32(w[i]), base + USDHC_DAT_PORT_OFF);
-	}
-	if (!usdhc_wait_set(base, USDHC_INT_STATUS_OFF, IRQSTAT_TC)) {
+	if (!usdhc_wait_set(m->int_status, IRQSTAT_TC)) {
 		printf("mmc: wport TC timeout, sts=%08x\n",
-		       readl(base + USDHC_INT_STATUS_OFF));
+		       readl(m->int_status));
 		return -2;
 	}
-	if (readl(base + USDHC_INT_STATUS_OFF) & (IRQSTAT_DTOE | IRQSTAT_CCE)) {
+	if (readl(m->int_status) & (IRQSTAT_DTOE | IRQSTAT_CCE)) {
 		printf("mmc: wport data err, sts=%08x\n",
-		       readl(base + USDHC_INT_STATUS_OFF));
+		       readl(m->int_status));
 		return -2;
 	}
-	writel(IRQSTAT_TC | IRQSTAT_BWTEN, base + USDHC_INT_STATUS_OFF);
+	writel(IRQSTAT_TC | IRQSTAT_BWTEN, m->int_status);
 	return 0;
 }
 
@@ -449,6 +539,7 @@ static void sd_cmd0(u32 base)
  */
 static int sd_speed_up(u32 base, u32 rca)
 {
+	const struct usdhc_map *m = usdhc_map_get(base);
 	u32 status[16];			/* CMD6 返回 64B 状态，只验 R1 不解析 */
 	u32 r;
 	int ret, hz;
@@ -464,8 +555,8 @@ static int sd_speed_up(u32 base, u32 rca)
 	if (ret) {
 		return -1;		/* 4 位是 SD 卡强制能力，失败即异常 */
 	}
-	writel((readl(base + USDHC_PROT_CTRL_OFF) & ~PROT_CTRL_DTW_MASK) |
-	       PROT_CTRL_DTW_4BIT, base + USDHC_PROT_CTRL_OFF);
+	writel((readl(m->prot_ctrl) & ~PROT_CTRL_DTW_MASK) |
+	       PROT_CTRL_DTW_4BIT, m->prot_ctrl);
 
 	hz = usdhc_set_clock(base, CLK_DS_HZ);
 	if (hz < 0) {
@@ -474,7 +565,7 @@ static int sd_speed_up(u32 base, u32 rca)
 
 	/* CMD6 mode switch：arg=0x80|保留组 0xF|group1 选 1(High Speed)，
 	 * R1 bit7 = switch error（SD 规范 CARD_STATUS 的 SWITCH_ERROR）*/
-	writel((1 << 16) | 64, base + USDHC_BLK_ATT_OFF);
+	writel((1 << 16) | 64, m->blk_att);
 	ret = usdhc_send_cmd(base, 6, 0x80FFFFF1U,
 			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN | XFERTYP_CICEN |
 			     XFERTYP_DPSEL,
@@ -501,6 +592,7 @@ static int sd_speed_up(u32 base, u32 rca)
  */
 static int emmc_speed_up(u32 base)
 {
+	const struct usdhc_map *m = usdhc_map_get(base);
 	u32 r;
 	int ret, hz;
 
@@ -510,8 +602,8 @@ static int emmc_speed_up(u32 base)
 	if (ret) {
 		return -1;
 	}
-	writel((readl(base + USDHC_PROT_CTRL_OFF) & ~PROT_CTRL_DTW_MASK) |
-	       PROT_CTRL_DTW_4BIT, base + USDHC_PROT_CTRL_OFF);
+	writel((readl(m->prot_ctrl) & ~PROT_CTRL_DTW_MASK) |
+	       PROT_CTRL_DTW_4BIT, m->prot_ctrl);
 
 	hz = usdhc_set_clock(base, CLK_DS_HZ);
 	if (hz < 0) {
@@ -538,10 +630,12 @@ static int emmc_speed_up(u32 base)
 /** SD 识别：CMD0 -> CMD8 -> ACMD41(轮询 busy) -> CMD2 -> CMD3 -> CMD9 -> CMD7 */
 int sd_init(struct mmc_card *card)
 {
+	const struct usdhc_map *m;
 	u32 base = USDHC1_BASE, r;
 	int i, ret;
 
-	writel(readl(CCGR6_REG) | (3 << 2), CCGR6_REG);	/* usdhc1 门控 */
+	m = usdhc_map_get(base);
+	writel(readl(CCM_CCGR6) | (3 << 2), CCM_CCGR6);	/* usdhc1 门控 */
 	pins_setup(sd1_pins, sizeof(sd1_pins) / sizeof(sd1_pins[0]));
 	if (usdhc_hw_init(base)) {
 		return -1;
@@ -593,7 +687,7 @@ int sd_init(struct mmc_card *card)
 	usdhc_send_cmd(base, 9, card->rca,
 		       XFERTYP_RSPTYP_136 | XFERTYP_CCCEN, 0, NULL);	/* CSD */
 	for (i = 0; i < 4; i++) {
-		card->csd_raw[i] = readl(base + USDHC_RSP0_OFF + i * 4);
+		card->csd_raw[i] = readl(m->cmd_rsp0 + i * 4);
 	}
 	r2_deshift(card->csd_raw);		/* 去硬件 8 位偏移 -> 规范布局 */
 
@@ -629,10 +723,13 @@ int sd_init(struct mmc_card *card)
 /** eMMC 识别：CMD0 -> CMD1(轮询 busy) -> CMD2 -> CMD3(RCA=1) -> CMD9 -> CMD7 */
 int emmc_init(struct mmc_card *card)
 {
+	const struct usdhc_map *m;
 	u32 base = USDHC2_BASE, r;
 	int i, ret;
 
-	writel(readl(CCGR6_REG) | (3 << 4), CCGR6_REG);	/* usdhc2 门控 */
+	m = usdhc_map_get(base);
+
+	writel(readl(CCM_CCGR6) | (3 << 4), CCM_CCGR6);	/* usdhc2 门控 */
 	pins_setup(emmc_pins, sizeof(emmc_pins) / sizeof(emmc_pins[0]));
 	if (usdhc_hw_init(base)) {
 		return -1;
@@ -669,7 +766,7 @@ int emmc_init(struct mmc_card *card)
 	usdhc_send_cmd(base, 9, card->rca,
 		       XFERTYP_RSPTYP_136 | XFERTYP_CCCEN, 0, NULL);
 	for (i = 0; i < 4; i++) {
-		card->csd_raw[i] = readl(base + USDHC_RSP0_OFF + i * 4);
+		card->csd_raw[i] = readl(m->cmd_rsp0 + i * 4);
 	}
 	r2_deshift(card->csd_raw);		/* 去硬件 8 位偏移 -> 规范布局 */
 
@@ -689,7 +786,7 @@ int emmc_init(struct mmc_card *card)
 	 * CSD v3 对 >2GB 不含容量，必须走 EXT_CSD；数据口机制与读路径
 	 * 同款（R1 + BRR 收 512B，bswap 归一后 w[53] 即 SEC_COUNT）。
 	 */
-	writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
+	writel((1 << 16) | MMC_BLOCK_SIZE, m->blk_att);
 	ret = usdhc_send_cmd(base, 8, card->rca,	/* 已是 arg 格式，勿再移 */
 			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
 			     XFERTYP_CICEN | XFERTYP_DPSEL,
@@ -714,30 +811,33 @@ int emmc_init(struct mmc_card *card)
 
 /* ---- 块读取 ---- */
 
+/* CMD18 多块读（MSBSEL+BCEN+AC12EN；BLK_ATT 带块数）：一条命令收完
+ * nblocks，块间命令往返消失——读吞吐主要来源。单块也走此路径
+ * （AC12EN 单块被硬件忽略，RM 58.8.19） */
 int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
 		     void (*progress)(u32 done, u32 total))
 {
 	u32 base = card->base;
-	u32 *p = buf;
+	const struct usdhc_map *m = usdhc_map_get(base);
 	int ret;
 
-	for (u32 i = 0; i < nblocks; i++) {
-		writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
-		ret = usdhc_send_cmd(base, 17, lba + i,
-				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
-				     XFERTYP_CICEN | XFERTYP_DPSEL,
-				     MIX_CTRL_BCEN | MIX_CTRL_DTDSEL_READ,
-				     NULL);
-		if (ret) {
-			return -1;
-		}
-		if (usdhc_read_data_port(base, p, MMC_BLOCK_SIZE / 4)) {
-			return -2;
-		}
-		p += MMC_BLOCK_SIZE / 4;
-		if (progress) {
-			progress(i + 1, nblocks);
-		}
+	writel((nblocks << 16) | MMC_BLOCK_SIZE, m->blk_att);
+	ret = usdhc_send_cmd(base, 18, lba,
+			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+			     XFERTYP_CICEN | XFERTYP_DPSEL,
+			     MIX_CTRL_MSBSEL | MIX_CTRL_BCEN |
+			     MIX_CTRL_DTDSEL_READ | MIX_CTRL_AC12EN,
+			     NULL);
+	if (ret) {
+		printf("mmc: CMD18 fail lba=%u n=%u ret=%d\n", lba, nblocks,
+		       ret);
+		return -1;
+	}
+	if (usdhc_read_data_port(base, buf, nblocks * MMC_BLOCK_SIZE / 4)) {
+		return -2;
+	}
+	if (progress) {
+		progress(nblocks, nblocks);
 	}
 	return 0;
 }
@@ -745,8 +845,9 @@ int mmc_read_blocks(struct mmc_card *card, u32 lba, u32 nblocks, void *buf,
 /**
  * mmc_write_blocks() - 向卡的用户区写入若干 512 字节块
  *
- * CMD24 逐块写（与读路径 CMD17 同款 PIO 风格，多块 CMD25 是后续课题）。
- * 每块后等卡编程完成（CMD13 READY_FOR_DATA）再发下一块。
+ * CMD25 多块写（MSBSEL+BCEN+AC12EN）：一条命令流式推 nblocks，块间
+ * CMD24/CMD13 往返消失；卡编程忙由 DAT0 反压、FIFO 自动停发消化，
+ * 收尾一次 CMD13 等编程完成。nblocks ≤ 16K chunk（download 层切好）。
  *
  * Return: 0 成功；-1 命令超时/错误；-2 数据错误；-3 卡编程未就绪；
  *         -4 越界/容量未知（烧录必须 fail closed，不许盲写）
@@ -755,7 +856,7 @@ int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
 		     const void *buf, void (*progress)(u32 done, u32 total))
 {
 	u32 base = card->base;
-	const u32 *p = buf;
+	const struct usdhc_map *m = usdhc_map_get(base);
 	int ret;
 
 	/* 容量兜底（第四轮评审 L1）：JBDL 层有 H1 校验，但 EXT_CSD/CSD
@@ -767,28 +868,26 @@ int mmc_write_blocks(struct mmc_card *card, u32 lba, u32 nblocks,
 		return -4;
 	}
 
-	for (u32 i = 0; i < nblocks; i++) {
-		writel((1 << 16) | MMC_BLOCK_SIZE, base + USDHC_BLK_ATT_OFF);
-		ret = usdhc_send_cmd(base, 24, lba + i,
-				     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
-				     XFERTYP_CICEN | XFERTYP_DPSEL,
-				     MIX_CTRL_BCEN,		/* DTDSEL=0 写方向 */
-				     NULL);
-		if (ret) {
-			printf("mmc: CMD24 fail lba=%u ret=%d\n", lba + i,
-			       ret);
-			return -1;
-		}
-		if (usdhc_write_data_port(base, p, MMC_BLOCK_SIZE / 4)) {
-			return -2;
-		}
-		p += MMC_BLOCK_SIZE / 4;
-		if (mmc_wait_card_ready(card)) {
-			return -3;
-		}
-		if (progress) {
-			progress(i + 1, nblocks);
-		}
+	writel((nblocks << 16) | MMC_BLOCK_SIZE, m->blk_att);
+	ret = usdhc_send_cmd(base, 25, lba,
+			     XFERTYP_RSPTYP_48 | XFERTYP_CCCEN |
+			     XFERTYP_CICEN | XFERTYP_DPSEL,
+			     MIX_CTRL_MSBSEL | MIX_CTRL_BCEN |	/* DTDSEL=0 写方向 */
+			     MIX_CTRL_AC12EN,
+			     NULL);
+	if (ret) {
+		printf("mmc: CMD25 fail lba=%u n=%u ret=%d\n", lba, nblocks,
+		       ret);
+		return -1;
+	}
+	if (usdhc_write_data_port(base, buf, nblocks * MMC_BLOCK_SIZE / 4)) {
+		return -2;
+	}
+	if (mmc_wait_card_ready(card)) {
+		return -3;
+	}
+	if (progress) {
+		progress(nblocks, nblocks);
 	}
 	return 0;
 }

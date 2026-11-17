@@ -37,13 +37,15 @@ SECTIONS
 		__bss_end = .;
 	} > OCRAM
 
-	/* 时间线记录区（timer.c）：256 条 × 16B = 4KB，NOLOAD 不占镜像。
-	 * 容量改这里一处，模块按 __timelog_start/end 自动得出 */
+	/* 时间线记录区（timer.c）：128 条 × 16B = 2KB，NOLOAD 不占镜像。
+	 * 容量改这里一处，模块按 __timelog_start/end 自动得出。
+	 * （2026-11-17：4K→2K——USB 下载乒乓双缓冲多占 16K bss，调试
+	 * 记录让路；128 条对启动时间线仍充裕） */
 	.timelog (NOLOAD) :
 	{
 		. = ALIGN(8);		/* timelog_entry 含 u64，8 字节对齐 */
 		__timelog_start = .;
-		. += 4K;
+		. += 2K;
 		__timelog_end = .;
 	} > OCRAM
 

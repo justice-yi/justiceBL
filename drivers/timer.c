@@ -20,20 +20,15 @@
 #include <math.h>
 #include <stddef.h>
 
-/* ---- SCTR（SP807 System Counter 控制块，0x021DC000）----
- * 寄存器偏移照 U-Boot systimer.h sctr_regs；RM 未给寄存器章
- * （ARM IP，文档在 ARM TRM，树内 U-Boot 即唯一权威参考）。*/
-#define SCTR_CNTCR_OFF		0x00	/* 控制：ENABLE/HDBG/FCREQ */
-#define SCTR_CNTFID0_OFF	0x20	/* 频率 ID：CNTCR.FCREQ=01 时选中 */
+/* ---- SCTR（SP807 System Counter 控制块）----
+ * 寄存器地址在 imx6ull.h 词典（SCTR_CNTCR/SCTR_CNTFID0）；RM 未给
+ * 寄存器章（ARM IP，文档在 ARM TRM，树内 U-Boot 即唯一权威参考）。*/
 #define SC_CNTCR_ENABLE		BIT(0)
 #define SC_CNTCR_HDBG		BIT(1)	/* 调试挂起时计数停走（U-Boot 同款）*/
 #define SC_CNTCR_FREQ0		BIT(8)	/* FCREQ=01：计数频率取 CNTFID0 */
 #define SC_CNTCR_FREQ1		BIT(9)
 
 #define SCTR_FREQ_HZ		8000000U	/* 固定 8MHz（U-Boot CONFIG_SC_TIMER_CLK）*/
-
-/* SCTR 寄存器访问时钟门控：CCGR5[CG1]（RM 时钟图 SCTR_CLK_ENABLE）*/
-#define CCGR5_REG		(MX6ULL_CCM_BASE + 0x7C)
 
 /* ---- 模块状态 ---- */
 static u32 timer_freq;
@@ -58,23 +53,23 @@ int timer_init(void)
 	u64 c0, c1;
 
 	/* 1. 开 SCTR 寄存器访问时钟（CCGR5[CG1]，保险写：复位值未知）*/
-	writel(readl(CCGR5_REG) | (3 << 2), CCGR5_REG);
+	writel(readl(CCM_CCGR5) | (3 << 2), CCM_CCGR5);
 
 	/* 2. 发布频率：CNTFRQ（CP15，给后续读架构定时器的软件）+ CNTFID0 */
 	__asm__ volatile ("mcr p15, 0, %0, c14, c0, 0" :: "r" (SCTR_FREQ_HZ));
-	writel(SCTR_FREQ_HZ, MX6ULL_SCTR_BASE + SCTR_CNTFID0_OFF);
+	writel(SCTR_FREQ_HZ, SCTR_CNTFID0);
 
 	/* 3. 使能计数器：FCREQ=01 选中 CNTFID0 作计数频率 */
-	writel((readl(MX6ULL_SCTR_BASE + SCTR_CNTCR_OFF) &
+	writel((readl(SCTR_CNTCR) &
 		~(SC_CNTCR_FREQ0 | SC_CNTCR_FREQ1)) |
 	       SC_CNTCR_FREQ0 | SC_CNTCR_ENABLE | SC_CNTCR_HDBG,
-	       MX6ULL_SCTR_BASE + SCTR_CNTCR_OFF);
+	       SCTR_CNTCR);
 
 	/* 4. 回读闭环：门控落盘、控制位落盘、计数确在递增 */
-	if ((readl(CCGR5_REG) & (3 << 2)) != (3 << 2)) {
+	if ((readl(CCM_CCGR5) & (3 << 2)) != (3 << 2)) {
 		return -1;
 	}
-	if ((readl(MX6ULL_SCTR_BASE + SCTR_CNTCR_OFF) &
+	if ((readl(SCTR_CNTCR) &
 	     (SC_CNTCR_ENABLE | SC_CNTCR_FREQ0)) !=
 	    (SC_CNTCR_ENABLE | SC_CNTCR_FREQ0)) {
 		return -2;

@@ -3,8 +3,10 @@
  * USB 设备引擎（ChipIdea IP 层）—— EP0 状态机 + 端点数据结构 + 轮询主循环。
  *
  * 耦合规则：
- *   - 本文件不含任何 i.MX 具体地址：控制器基址、时钟、PHY 全部来自
- *     usbd_soc.h 接口（换 SoC = 换 usbd_soc.c 实现）。
+ *   - 寄存器地址全部来自 imx6ull.h 词典（USB1_* 确切实例，规矩见
+ *     SDK AGENTS.md"寄存器定义规矩"）；时钟/PHY 上电序列归 usbd_soc.c。
+ *     （历史注：引擎曾走 IP 偏移 + usbd_soc 映射求换 SoC 可移植，按
+ *     YAGNI 降级直引词典——真复用 ChipIdea 时再抽偏移层。）
  *   - 协议内容（描述符、请求解码）全部来自 usb_ch9.c（换身份/协议不碰引擎）。
  *   - 本文件持有的是 ChipIdea IP 级常量（寄存器偏移、dQH/dTD 布局），
  *     出处为 RM 56.4.5（数据结构）/56.4.6（设备操作模型）/56.6.x（寄存器）。
@@ -17,31 +19,16 @@
  */
 
 #include <types.h>
+#include <imx6ull.h>
 #include <printf.h>
 #include <usb_config.h>
 #include "usb_ch9.h"
 #include "usb_eng.h"
-#include "usb_dl.h"
+#include "download.h"
 #include "usbd_soc.h"
 #include <usbd.h>
 
-/* ---- IP 级寄存器偏移（RM 56.6.x，绝对地址 = usbd_soc_core_base() + off） ---- */
-#define R_USBCMD		0x140		/* 56.6.18 */
-#define R_USBSTS		0x144
-#define R_USBINTR		0x148		/* 56.6.19 */
-#define R_DEVICEADDR		0x154		/* 56.6.23 */
-#define R_ENDPTLISTADDR		0x158		/* 56.6.25 */
-#define R_PORTSC1		0x184		/* 56.6.31 */
-#define R_OTGSC			0x1A4		/* 56.6.32 */
-#define R_USBMODE		0x1A8		/* 56.6.33 */
-#define R_ENDPTSETUPSTAT	0x1AC		/* 56.6.34 */
-#define R_ENDPTPRIME		0x1B0		/* 56.6.35 */
-#define R_ENDPTFLUSH		0x1B4		/* 56.6.36 */
-#define R_ENDPTSTAT		0x1B8		/* 56.6.37 */
-#define R_ENDPTCOMPLETE		0x1BC		/* 56.6.38 */
-#define R_ENDPTCTRL0		0x1C0		/* 56.6.39，每端点 +4 */
-
-/* ---- 位定义 ---- */
+/* ---- 位定义（寄存器地址在 imx6ull.h 词典，RM 名 USB1_*） ---- */
 /* USBCMD（56.6.18） */
 #define USBCMD_RS		BIT(0)		/* Run/Stop：1=跑，D+ 上拉出现 */
 #define USBCMD_RST		BIT(1)		/* 控制器软复位，硬件自动清零 */
@@ -72,7 +59,7 @@
 #define EPCTRL_TXT_BULK		(0x2 << 18)
 #define EPCTRL_RXT_BULK		(0x2 << 2)
 /* prime/flush/complete：RX 位 = 端点号，TX 位 = 16+端点号 */
-#define EPBIT(ep, tx)		((tx) ? BIT(16 + (ep)) : BIT(ep))
+#define EPBIT(ep, dir_in)		((dir_in) ? BIT(16 + (ep)) : BIT(ep))
 
 /* ---- 数据结构（RM 56.4.5） ---- */
 
@@ -110,17 +97,17 @@ __extension__ _Static_assert(sizeof(struct usb_dtd) == 32, "dTD must be 32B");
 /* EP0 大包 64；描述符最长 32+字符串都 ≤64，单 dTD 单包足够（why: 控制传输无大数据） */
 #define EP0_MPS			64
 
-/* 端点布置：下标 = ep*2 + (tx?1:0)，RM 图 56-27"偶收奇发" */
-#define QH_IDX(ep, tx)		(((ep) * 2) + ((tx) ? 1 : 0))
+/* 端点布置：下标 = ep*2 + (dir_in?1:0)，RM 图 56-27"偶收奇发" */
+#define QH_IDX(ep, dir_in)		(((ep) * 2) + ((dir_in) ? 1 : 0))
 
 static struct usb_dqh qh[4] __attribute__((aligned(4096)));	/* ep0 rx/tx + ep1 rx/tx（U-Boot 用 4K 对齐，RM 最低 64） */
 static struct usb_dtd dtd[4] __attribute__((aligned(32)));	/* 与 qh 同序的 dTD 池 */
 
 static u8 dev_addr;		/* 当前 USB 设备地址（总线复位归 0） */
-static u32 primed_len[4];	/* 各方向 prime 的字节数（rx_len 反推实收用） */
-static u32 eng_rst_cnt;		/* 链路态代际计数：总线复位/EP1 flush 均
+static u32 primed_len[4];	/* 各方向提交的请求字节数（actual 反推用） */
+static u8 xfer_busy[4];		/* 各方向是否有在途请求（queue 置位/poll 完成清） */
+static u32 link_generation;		/* 链路态代际计数：总线复位/EP1 flush 均
 				 * +1，协议层凭"变了"丢弃状态自愈 */
-static u32 eng_xfer_err;	/* 上一次传输的 dTD 错误位（M1） */
 static u32 ep1_sw_halt;		/* host SET_FEATURE(ENDPOINT_HALT) 请求的 halt：
 				 * 置位期间 poll 自愈不得清除（评审 M2） */
 
@@ -144,7 +131,7 @@ static void xcopy(void *dst, const void *src, u32 n)
  * ZLT=0（允许硬件自动补零长包收尾）、MULT=00（非 ISO 端点必须，RM 表注）。
  * EP0 的 IOS=1：收到 setup 时置 UI 位（轮询模式下无所谓，按规范语义保留）。
  */
-static void qh_reinit(void)
+static void usb_dqh_reset(void)
 {
 	u32 i;
 
@@ -160,168 +147,181 @@ static void qh_reinit(void)
 	}
 }
 
-/* 组一个 dTD 并挂到 dQH 上，随后由调用方写 PRIME 位（RM 56.4.6.4.2.2/3） */
-int eng_ep_prime(u8 ep, u8 tx, const void *buf, u32 len)
+/* ---- 请求模型（U-Boot ci_udc 的 usb_ep_queue 同构）----
+ * 在途状态由引擎跟踪（xfer_busy）：queue 置位、poll 完成清位——
+ * 协议层不持影子标志。请求对象 struct usb_xfer 定义见 usb_eng.h */
+
+/* 提交一次端点传输：填工单 dTD → 挂岗位牌 dQH → 按 PRIME 门铃。
+ * 返回后硬件自主搬运，CPU 可去干别的（乒乓流水线的立足点） */
+int usb_ep_queue(u8 ep, u8 dir_in, struct usb_xfer *xfer)
 {
-	u32 idx = QH_IDX(ep, tx);
+	u32 idx = QH_IDX(ep, dir_in);
 	struct usb_dtd *d = &dtd[idx];
-	u32 bit = EPBIT(ep, tx);
+	u32 bit = EPBIT(ep, dir_in);
 	u32 to = WAIT_LOOPS;
 	u32 p;
 
-	if (len > 0x4000)			/* RM：单 dTD 建议 ≤16K，这里远用不到 */
+	if (xfer->len > 0x4000)			/* RM：单 dTD 建议 ≤16K，这里远用不到 */
 		return -1;
+
+	xfer->actual = 0;
+	xfer->err = 0;
 
 	/* dTD：终止链（单描述符）、长度、ACTIVE 置位、5 页缓冲指针。
 	 * 页指针约定（U-Boot ci_udc:485-489 同款）：page0 = 完整地址（[11:0]
 	 * 是硬件用的页内起始偏移，不能丢！），page1-4 = 4K 对齐基址 + 步进 */
 	d->next = DTD_TERMINATE;
-	d->token = (len << 16) | DTD_ACTIVE;
-	p = (u32)buf & 0xFFFFF000u;
-	d->buf[0] = (u32)buf;
+	d->token = (xfer->len << 16) | DTD_ACTIVE;
+	p = (u32)xfer->buf & 0xFFFFF000u;
+	d->buf[0] = (u32)xfer->buf;
 	for (u32 i = 1; i < 5; i++)
 		d->buf[i] = p + (i << 12);
 
 	qh[idx].next_dtd = (u32)d;		/* T=0：指针有效 */
-	primed_len[idx] = len;
-	eng_xfer_err = 0;
+	primed_len[idx] = xfer->len;
+	xfer_busy[idx] = 1;
 	/* ARM posted write：dTD/dQH 内容必须先于 PRIME 寄存器写到达——
 	 * 无 cache 时是防御性屏障，将来开 cache 后是必需（评审 M 建议） */
 	__asm__ volatile ("dmb ish" ::: "memory");
 
 	/* 写 PRIME 位；硬件把 dTD 拷进 dQH overlay，位置就绪 */
-	usbd_soc_wr32(R_ENDPTPRIME, bit);
-	while (usbd_soc_rd32(R_ENDPTPRIME) & bit) {
+	writel(bit, USB1_ENDPTPRIME);
+	while (readl(USB1_ENDPTPRIME) & bit) {
 		if (--to == 0)
 			return -1;
 	}
 	/* RM：PRIME 清零且 ENDPTSTAT 置位 = prime 成功。注意两步之间有硬件
 	 * 延迟——STAT 必须轮询等待，读一次会误判失败（2026-11-08 实测踩坑） */
 	to = 1000;
-	while (!(usbd_soc_rd32(R_ENDPTSTAT) & bit) && --to)
+	while (!(readl(USB1_ENDPTSTAT) & bit) && --to)
 		;
-	if (!(usbd_soc_rd32(R_ENDPTSTAT) & bit))
+	if (!(readl(USB1_ENDPTSTAT) & bit)) {
+		xfer_busy[idx] = 0;
 		return -1;
-	return 0;
-}
-
-/* 等一个端点方向传输完成（ENDPTCOMPLETE 置位），W1C 清掉后返回 0 */
-int eng_ep_wait_done(u8 ep, u8 tx)
-{
-	u32 bit = EPBIT(ep, tx);
-	u32 to = WAIT_LOOPS;
-
-	while (!(usbd_soc_rd32(R_ENDPTCOMPLETE) & bit)) {
-		/* 期间若主机直接来新 setup，当前传输作废（RM 56.4.6.4.2.2） */
-		if (usbd_soc_rd32(R_ENDPTSETUPSTAT) & 1)
-			return 1;		/* 1 = 被新 setup 打断，调用方丢弃本次 */
-		if (--to == 0)
-			return -1;
 	}
-	usbd_soc_wr32(R_ENDPTCOMPLETE, bit);	/* W1C */
 	return 0;
 }
 
-/* 非阻塞查询完成位；1=完成（已 W1C） */
-int eng_ep_check_done(u8 ep, u8 tx)
+/* 非阻塞查询：-1=未提交（调用方应 queue），0=在途，1=完成
+ * （xfer.actual/err 已锁存） */
+int usb_ep_poll(u8 ep, u8 dir_in, struct usb_xfer *xfer)
 {
-	u32 bit = EPBIT(ep, tx);
+	u32 idx = QH_IDX(ep, dir_in);
+	u32 bit = EPBIT(ep, dir_in);
 
-	if (!(usbd_soc_rd32(R_ENDPTCOMPLETE) & bit))
+	if (!xfer_busy[idx])
+		return -1;
+	if (!(readl(USB1_ENDPTCOMPLETE) & bit))
 		return 0;
-	usbd_soc_wr32(R_ENDPTCOMPLETE, bit);
+	writel(bit, USB1_ENDPTCOMPLETE);	/* W1C */
+	xfer_busy[idx] = 0;
 	/* M1：dTD 错误位（HALTED/BufferError/TxError）——
 	 * USB 包级 CRC 由硬件重传保证，这里只捕 babble/buffer 异常 */
-	eng_xfer_err = dtd[QH_IDX(ep, tx)].token & 0x7E;
+	xfer->err = dtd[idx].token & 0x7E;
+	xfer->actual = primed_len[idx] - ((dtd[idx].token >> 16) & 0x7FFF);
 	return 1;
 }
 
-/* 上一次传输的 dTD 错误位（0=正常）；prime 时自动清零 */
-u32 eng_last_xfer_err(void)
+/* 阻塞等完成（EP0 控制传输用）：0=完成；1=被新 setup 打断（本次作废，
+ * 主机会重发 setup）；-1=超时 */
+int usb_ep_wait(u8 ep, u8 dir_in, struct usb_xfer *xfer)
 {
-	return eng_xfer_err;
-}
+	u32 to = WAIT_LOOPS;
 
-/* 上一次 OUT 实收字节数 = prime 长度 - dTD 剩余量（check_done=1 后读） */
-u32 eng_ep_rx_len(u8 ep, u8 tx)
-{
-	u32 idx = QH_IDX(ep, tx);
-
-	return primed_len[idx] - ((dtd[idx].token >> 16) & 0x7FFF);
+	while (!usb_ep_poll(ep, dir_in, xfer)) {
+		/* 期间若主机直接来新 setup，当前传输作废（RM 56.4.6.4.2.2） */
+		if (readl(USB1_ENDPTSETUPSTAT) & 1)
+			return 1;
+		if (--to == 0)
+			return -1;
+	}
+	return 0;
 }
 
 /* 总线复位事件计数器：协议层靠"计数变了"自愈状态机 */
-u32 eng_reset_count(void)
+u32 usb_link_generation(void)
 {
-	return eng_rst_cnt;
+	return link_generation;
 }
 
 /* EP1 双向 FLUSH：清挂起 dTD 并复位 data toggle（RM 56.4.6.4.4；被冲
  * 掉的传输不产生完成位），有界等待；清 stall 位前必须 flush，否则残留
  * dTD 与后续 prime 竞态。
- * 任何 flush 都会作废协议层已武装的 RX——这里递增代际计数广播"链路态
- * 变了"，usbdl 凭计数变化丢弃 rx_armed/进行中状态并重 arm（否则武装
- * 已失、完成位永不来，主机侧 10s NAK 超时，2026-11-12 实测） */
-static void ep1_flush(void)
+ * ★在途工单被硬件作废，引擎 busy 必须同步清零——否则 poll 永远报"在
+ * 途"、不再重新提交请求，主机 NAK 超时（2026-11-17 板上实证：SET_CONFIG
+ * 时 flush 冲掉已 arm 的头接收，PING 首包 LIBUSB_ERROR_TIMEOUT）。
+ * 代际计数同时递增广播"链路态变了"，协议层丢弃进行中状态重收 */
+static void usb_ep1_flush(void)
 {
 	u32 bits = EPBIT(USB_BULK_EP, 0) | EPBIT(USB_BULK_EP, 1);
 	u32 to = WAIT_LOOPS;
 
-	usbd_soc_wr32(R_ENDPTFLUSH, bits);
-	while ((usbd_soc_rd32(R_ENDPTFLUSH) & bits) && --to)
+	writel(bits, USB1_ENDPTFLUSH);
+	while ((readl(USB1_ENDPTFLUSH) & bits) && --to)
 		;
-	eng_rst_cnt++;
+	xfer_busy[QH_IDX(USB_BULK_EP, 0)] = 0;
+	xfer_busy[QH_IDX(USB_BULK_EP, 1)] = 0;
+	link_generation++;
 }
 
 /* 清 EP1 双向 stall 位，返回清除的位 */
-static u32 ep1_clear_stall_bits(void)
+static u32 usb_ep1_clear_stall_bits(void)
 {
-	u32 ctrl = R_ENDPTCTRL0 + 4 * USB_BULK_EP;
-	u32 c = usbd_soc_rd32(ctrl);
+	u32 ctrl = USB1_ENDPTCTRL1;
+	u32 c = readl(ctrl);
 	u32 hit = c & (EPCTRL_RXS | EPCTRL_TXS);
 
 	if (hit)
-		usbd_soc_wr32(ctrl, c & ~hit);
+		writel(c & ~hit, ctrl);
 	return hit;
 }
 
 /* EP1 stall 自愈：host 请求的 halt（ep1_sw_halt）期间不撤；否则先 FLUSH
  * （复位 data toggle + 丢挂起 dTD）再清 stall 位。返回清除的位（0=无动作），
  * 调用方打印定位 */
-u32 eng_ep1_stall_recover(void)
+u32 usb_ep1_clear_unexpected_stall(void)
 {
 	u32 hit;
 
 	if (ep1_sw_halt)
 		return 0;
-	hit = ep1_clear_stall_bits();
+	hit = usb_ep1_clear_stall_bits();
 	if (hit)
-		ep1_flush();
+		usb_ep1_flush();
 	return hit;
 }
 
 /* host SET_FEATURE(ENDPOINT_HALT)：只置寻址方向的 stall（评审 M1/M2） */
-void eng_ep1_set_stall(u8 dir_in)
+void usb_ep1_halt_set(u8 dir_in)
 {
-	u32 ctrl = R_ENDPTCTRL0 + 4 * USB_BULK_EP;
-	u32 c = usbd_soc_rd32(ctrl);
+	u32 ctrl = USB1_ENDPTCTRL1;
+	u32 c = readl(ctrl);
 
 	ep1_sw_halt = 1;
-	usbd_soc_wr32(ctrl, c | (dir_in ? EPCTRL_TXS : EPCTRL_RXS));
+	writel(c | (dir_in ? EPCTRL_TXS : EPCTRL_RXS), ctrl);
 }
 
 /* host CLEAR_FEATURE(ENDPOINT_HALT)：解除软件 halt + FLUSH 复位 toggle */
-void eng_ep1_halt_clear(void)
+void usb_ep1_halt_clear(void)
 {
 	ep1_sw_halt = 0;
-	ep1_flush();
-	ep1_clear_stall_bits();
+	usb_ep1_flush();
+	usb_ep1_clear_stall_bits();
+}
+
+/* 作废 EP1 OUT 在途接收请求：协议层写失败弃流/正常收尾时清场。
+ * FLUSH 作废在途工单（不产生完成位）+ 复位 toggle；代际递增由
+ * usb_ep1_flush 统一广播，协议层 link_changed 自动归零状态 */
+void usb_ep1_rx_abort(void)
+{
+	xfer_busy[QH_IDX(USB_BULK_EP, 0)] = 0;
+	usb_ep1_flush();
 }
 
 /* EP1 halt 状态（GET_STATUS(endpoint) 应答用）：bit0=RXS bit1=TXS */
-u32 eng_ep1_halt_bits(void)
+u32 usb_ep1_halt_status(void)
 {
-	u32 c = usbd_soc_rd32(R_ENDPTCTRL0 + 4 * USB_BULK_EP);
+	u32 c = readl(USB1_ENDPTCTRL1);
 	u32 bits = 0;
 
 	if (c & EPCTRL_RXS)
@@ -335,18 +335,18 @@ u32 eng_ep1_halt_bits(void)
  * 使能 EP1 双向 bulk。**规范时机 = 进入 Configured 态（SET_CONFIG，
  * RM 56.4.6.2），由 ep0_handle_setup 调用**；总线复位会禁用除 EP0 外
  * 全部端点（RM 56.4.6.2.1），且禁用动作发生在复位结束/速度判定时——
- * URI 置位瞬间（bus_reset 里）写的使能会被它覆盖，这就是真机
+ * URI 置位瞬间（usb_bus_reset 里）写的使能会被它覆盖，这就是真机
  * LIBUSB_ERROR_PIPE 首包即挂的根因（2026-11-11 板上两轮实证：枚举
  * 正常、EP1 首包 STALL、stall 探针无声——禁用端点不置 stall 位）。
  * U-Boot ci_udc（ep_enable 挂 SET_CONFIG/set_alt 路径）/Linux
  * chipidea 同款。RXR/TXR 数据翻转复位位按 U-Boot ep_enable 同款带上
  * （ci_udc.c:330）。
  */
-static void ep1_bulk_enable(void)
+static void usb_ep1_bulk_enable(void)
 {
-	usbd_soc_wr32(R_ENDPTCTRL0 + 4 * USB_BULK_EP,
-		      EPCTRL_RXT_BULK | EPCTRL_RXE | EPCTRL_RXR |
-		      EPCTRL_TXT_BULK | EPCTRL_TXE | EPCTRL_TXR);
+	writel(EPCTRL_RXT_BULK | EPCTRL_RXE | EPCTRL_RXR |
+	       EPCTRL_TXT_BULK | EPCTRL_TXE | EPCTRL_TXR,
+	       USB1_ENDPTCTRL1);
 }
 
 /* ---- EP0 处理 ---- */
@@ -354,26 +354,26 @@ static void ep1_bulk_enable(void)
 /* 协议 stall：两方向成对置位（RM 56.4.6.3.2：单次写保证同时刻生效） */
 static void ep0_stall(void)
 {
-	u32 c = usbd_soc_rd32(R_ENDPTCTRL0);
+	u32 c = readl(USB1_ENDPTCTRL0);
 
-	usbd_soc_wr32(R_ENDPTCTRL0, c | EPCTRL_TXS | EPCTRL_RXS);
+	writel(c | EPCTRL_TXS | EPCTRL_RXS, USB1_ENDPTCTRL0);
 }
 
 static void ep0_clear_stall(void)
 {
-	u32 c = usbd_soc_rd32(R_ENDPTCTRL0);
+	u32 c = readl(USB1_ENDPTCTRL0);
 
-	usbd_soc_wr32(R_ENDPTCTRL0, c & ~(EPCTRL_TXS | EPCTRL_RXS));
+	writel(c & ~(EPCTRL_TXS | EPCTRL_RXS), USB1_ENDPTCTRL0);
 }
 
 /* 状态阶段（IN 方向 ZLP）：total=0 的 dTD，RM 明言硬件执行零长事务 */
 static int ep0_status_in(void)
 {
-	int ret = eng_ep_prime(0, 1, 0, 0);
+	struct usb_xfer z = { .len = 0 };
 
-	if (ret)
-		return ret;
-	return eng_ep_wait_done(0, 1);
+	if (usb_ep_queue(0, 1, &z))
+		return -1;
+	return usb_ep_wait(0, 1, &z);
 }
 
 /*
@@ -387,13 +387,14 @@ static int ep0_read_setup(u8 raw[8])
 	struct usb_dqh *rx = &qh[QH_IDX(0, 0)];
 	int retry;
 
-	usbd_soc_wr32(R_ENDPTSETUPSTAT, 1);		/* a. W1C 清 setup 标志 */
+	writel(1, USB1_ENDPTSETUPSTAT);		/* a. W1C 清 setup 标志 */
 	for (retry = 0; retry < 3; retry++) {		/* 有界：防主机 hammer 造成无声死锁 */
-		usbd_soc_wr32(R_USBCMD, USBCMD_SUTW |	/* b. 信号量立起 */
-				 (usbd_soc_rd32(R_USBCMD) & ~USBCMD_SUTW));
+		writel(USBCMD_SUTW |	/* b. 信号量立起 */
+		       (readl(USB1_USBCMD) & ~USBCMD_SUTW),
+		       USB1_USBCMD);
 		xcopy(raw, (const void *)rx->setup, 8);	/* c. 抄 8 字节 */
-		if (usbd_soc_rd32(R_USBCMD) & USBCMD_SUTW) {	/* d. 仍立起 = 撕裂未发生 */
-			usbd_soc_wr32(R_USBCMD, usbd_soc_rd32(R_USBCMD) & ~USBCMD_SUTW);	/* e. 放倒 */
+		if (readl(USB1_USBCMD) & USBCMD_SUTW) {	/* d. 仍立起 = 撕裂未发生 */
+			writel(readl(USB1_USBCMD) & ~USBCMD_SUTW, USB1_USBCMD);	/* e. 放倒 */
 			return 0;
 		}
 	}
@@ -431,35 +432,44 @@ static void ep0_handle_setup(void)
 			return;
 		}
 		if (epnum == USB_BULK_EP) {
-			u32 h = eng_ep1_halt_bits();
+			u32 h = usb_ep1_halt_status();
 
 			ep_st[0] = (dir_in ? (h & 2) : (h & 1)) ? 1 : 0;
 		} else {
 			ep_st[0] = 0;			/* ep0 恒不 halt */
 		}
 		ep_st[1] = 0;
-		fail = eng_ep_prime(0, 1, ep_st, 2) ||
-		       eng_ep_wait_done(0, 1) ||
-		       eng_ep_prime(0, 0, 0, 0);
-		if (!fail)
-			eng_ep_wait_done(0, 0);
+		{
+			struct usb_xfer x = { .buf = ep_st, .len = 2 };
+
+			fail = usb_ep_queue(0, 1, &x) || usb_ep_wait(0, 1, &x);
+		}
+		if (!fail) {
+			struct usb_xfer z = { .len = 0 };
+
+			fail = usb_ep_queue(0, 0, &z);
+			if (!fail)
+				usb_ep_wait(0, 0, &z);
+		}
 		return;
 	}
 
 	usb_ch9_handle_setup(&s, &r);
 
 	switch (r.action) {
-	case USB_CH9_DATA_IN:
+	case USB_CH9_DATA_IN: {
 		/* 数据阶段：IN 方向发 reply 数据；随后状态阶段 OUT 方向收 ZLP。
 		 * 任一步失败/被打断即整体作废——主机会重发 setup */
-		if (eng_ep_prime(0, 1, r.data, r.len))
+		struct usb_xfer x = { .buf = (void *)r.data, .len = r.len };
+		struct usb_xfer z = { .len = 0 };
+
+		if (usb_ep_queue(0, 1, &x) || usb_ep_wait(0, 1, &x))
 			break;
-		if (eng_ep_wait_done(0, 1))
+		if (usb_ep_queue(0, 0, &z))	/* 状态 ZLP 从主机视角是 OUT */
 			break;
-		if (eng_ep_prime(0, 0, 0, 0))	/* 状态 ZLP 从主机视角是 OUT */
-			break;
-		eng_ep_wait_done(0, 0);
+		usb_ep_wait(0, 0, &z);
 		break;
+	}
 
 	case USB_CH9_STATUS_IN:
 		/* SET_ADDRESS 特例：借助 USBADRA 暂存，状态 ZLP 发完硬件才生效
@@ -467,22 +477,22 @@ static void ep0_handle_setup(void)
 		if (s.bRequest == USB_REQ_SET_ADDRESS) {
 			u8 a = s.wValue & 0x7F;
 
-			usbd_soc_wr32(R_DEVICEADDR, DEVICEADDR_USBADRA | ((u32)a << 25));
+			writel(DEVICEADDR_USBADRA | ((u32)a << 25), USB1_DEVICEADDR);
 			dev_addr = a;
 		}
 		/* 端点使能的规范时机 = 进入 Configured 态（RM 56.4.6.2：
 		 * "Entry into the Configured indicates that all endpoints ...
 		 * have been properly initialized by programming the
 		 * USB_UOG_ENDPTCTRLx registers"）。总线复位结束时硬件才禁用
-		 * 非 EP0 端点（56.4.6.2.1），bus_reset() 里 URI 瞬间写的使能
+		 * 非 EP0 端点（56.4.6.2.1），usb_bus_reset() 里 URI 瞬间写的使能
 		 * 会被它覆盖（22:30/22:55 两轮板上实证：首包 PIPE、stall 探针
 		 * 无声）。U-Boot ci_udc 的 ep_enable 同挂 SET_CONFIG 路径 */
 		if (s.bRequest == USB_REQ_SET_CONFIGURATION &&
 		    (s.wValue & 0xFF) == 1) {
-			ep1_flush();		/* 清挂起 dTD + data toggle 复位；
-						 * 冲掉的武装由 ep1_flush 的
+			usb_ep1_flush();		/* 清挂起 dTD + data toggle 复位；
+						 * 冲掉的武装由 usb_ep1_flush 的
 						 * 代际递增通知协议层重 arm */
-			ep1_bulk_enable();
+			usb_ep1_bulk_enable();
 		}
 		ep0_status_in();
 		break;
@@ -493,12 +503,12 @@ static void ep0_handle_setup(void)
 		break;
 
 	case USB_CH9_EP1_CLEAR_HALT:
-		eng_ep1_halt_clear();
+		usb_ep1_halt_clear();
 		ep0_status_in();
 		break;
 
 	case USB_CH9_EP1_SET_HALT:
-		eng_ep1_set_stall(r.ep_dir);
+		usb_ep1_halt_set(r.ep_dir);
 		ep0_status_in();
 		break;
 
@@ -510,33 +520,34 @@ static void ep0_handle_setup(void)
 }
 
 /* 总线复位处理（RM 56.4.6.2.1：复位后地址回 0、状态机回默认） */
-static void bus_reset(void)
+static void usb_bus_reset(void)
 {
 	u32 flush = EPBIT(0, 0) | EPBIT(0, 1) | EPBIT(1, 0) | EPBIT(1, 1);
 	u32 speed;
 	u32 to = WAIT_LOOPS;
 
 	dev_addr = 0;
-	usbd_soc_wr32(R_DEVICEADDR, 0);
+	writel(0, USB1_DEVICEADDR);
 	ep1_sw_halt = 0;		/* host 请求的 halt 随复位解除 */
 	usb_ch9_reset();		/* 协议层状态归零（configured 等，评审 M3） */
 
 	/* 冲掉所有挂起的传输缓冲（buffer ready 被 USB reset 自动清，这里兜底） */
-	usbd_soc_wr32(R_ENDPTFLUSH, flush);
-	while (usbd_soc_rd32(R_ENDPTFLUSH) & flush) {
+	writel(flush, USB1_ENDPTFLUSH);
+	while (readl(USB1_ENDPTFLUSH) & flush) {
 		if (--to == 0)
 			break;
 	}
 
-	qh_reinit();					/* dQH 归零：解除一切挂起 */
-	ep1_bulk_enable();	/* 防御性：复位结束时的硬件禁用会覆盖此写入，
+	usb_dqh_reset();					/* dQH 归零：解除一切挂起 */
+	usb_ep1_bulk_enable();	/* 防御性：复位结束时的硬件禁用会覆盖此写入，
 				 * 真正生效的使能在 SET_CONFIG（ep0_handle_setup） */
 	primed_len[0] = primed_len[1] = primed_len[2] = primed_len[3] = 0;
-	eng_rst_cnt++;					/* 协议层感知复位、自愈状态机 */
-	usbd_soc_wr32(R_ENDPTSETUPSTAT, 1);		/* W1C 清残留标志 */
-	usbd_soc_wr32(R_ENDPTCOMPLETE, 0x30003);
+	xfer_busy[0] = xfer_busy[1] = xfer_busy[2] = xfer_busy[3] = 0;
+	link_generation++;					/* 协议层感知复位、自愈状态机 */
+	writel(1, USB1_ENDPTSETUPSTAT);		/* W1C 清残留标志 */
+	writel(0x30003, USB1_ENDPTCOMPLETE);
 
-	speed = (usbd_soc_rd32(R_PORTSC1) >> 26) & 3;
+	speed = (readl(USB1_PORTSC1) >> 26) & 3;
 	printf("usbd: bus reset, port speed %s\n",
 	       speed == 2 ? "high(480M)" : speed == 0 ? "full(12M)" : "?");
 }
@@ -553,36 +564,36 @@ static int usbd_hw_init(void)
 	usbd_soc_phy_init();
 
 	/* 步骤 1 前置：控制器软复位（RS 必须为 0，RST 硬件自清） */
-	usbd_soc_wr32(R_USBCMD, 0);
-	usbd_soc_wr32(R_USBCMD, USBCMD_RST);
-	while (usbd_soc_rd32(R_USBCMD) & USBCMD_RST)
+	writel(0, USB1_USBCMD);
+	writel(USBCMD_RST, USB1_USBCMD);
+	while (readl(USB1_USBCMD) & USBCMD_RST)
 		;
 
 	/* 步骤 1：USBMODE = 设备模式 + SLOM（=0xA）。RM：复位后只能写一次 */
-	usbd_soc_wr32(R_USBMODE, USBMODE_CM_DEV | USBMODE_SLOM);
+	writel(USBMODE_CM_DEV | USBMODE_SLOM, USB1_USBMODE);
 
 	/* 步骤 2/3：dQH 数组 + 列表地址（64 字节对齐，RM 56.6.25） */
-	qh_reinit();
-	usbd_soc_wr32(R_ENDPTLISTADDR, (u32)qh);
+	usb_dqh_reset();
+	writel((u32)qh, USB1_ENDPTLISTADDR);
 
 	/* EP0：RM 56.4.6.1 明言免配 ENDPTCTRL0（复位值 0080_0080 已使能收发、类型固定） */
 	/* EP1 bulk：RM Table 56-65——type=10 且上下半一致，RXE/TXE 使能。
-	 * 总线复位后此处失效；生效的使能在 SET_CONFIG（见 ep1_bulk_enable 注释） */
-	ep1_bulk_enable();
+	 * 总线复位后此处失效；生效的使能在 SET_CONFIG（见 usb_ep1_bulk_enable 注释） */
+	usb_ep1_bulk_enable();
 
 	/* 轮询模式：中断全屏蔽（RM 步骤 4 的替代实现） */
-	usbd_soc_wr32(R_USBINTR, 0);
+	writel(0, USB1_USBINTR);
 
 	/* 清残留状态 */
-	usbd_soc_wr32(R_ENDPTSETUPSTAT, 1);
-	usbd_soc_wr32(R_ENDPTCOMPLETE, 0x30003);
+	writel(1, USB1_ENDPTSETUPSTAT);
+	writel(0x30003, USB1_ENDPTCOMPLETE);
 
 	/* 步骤 5：RS=1 —— D+ 上拉出现，主机（PC）此刻才看到设备插入 */
 #if USB_FORCE_FULL_SPEED
 	/* PORTSC.PFSC(24)：强制全速连接（诊断期开关，见 usb_config.h） */
-	usbd_soc_wr32(R_PORTSC1, usbd_soc_rd32(R_PORTSC1) | BIT(24));
+	writel(readl(USB1_PORTSC1) | BIT(24), USB1_PORTSC1);
 #endif
-	usbd_soc_wr32(R_USBCMD, USBCMD_RS);
+	writel(USBCMD_RS, USB1_USBCMD);
 	return 0;
 }
 
@@ -602,21 +613,21 @@ void usbd_download_mode(void)
 	}
 	printf("usbd: waiting for host (plug OTG port)...\n");
 
-	usb_dl_start();			/* 识别并初始化烧写目标介质 */
+	download_media_init();			/* 识别并初始化烧写目标介质 */
 
 	/* 轮询主循环：永不返回。EP0=USB 枚举，EP1=JBDL 烧录协议 */
 	for (;;) {
-		u32 sts = usbd_soc_rd32(R_USBSTS);
+		u32 sts = readl(USB1_USBSTS);
 
 		if (sts & USBSTS_URI) {
-			bus_reset();
+			usb_bus_reset();
 		}
-		if (usbd_soc_rd32(R_ENDPTSETUPSTAT) & 1) {
+		if (readl(USB1_ENDPTSETUPSTAT) & 1) {
 			ep0_handle_setup();
 		}
-		usb_dl_poll();		/* EP1 命令/数据状态机 */
+		download_poll();		/* EP1 命令/数据状态机 */
 
 		/* W1C 清已见过的状态位（错误位也清掉，防重复进错误路径） */
-		usbd_soc_wr32(R_USBSTS, sts & USBSTS_W1C_MASK);
+		writel(sts & USBSTS_W1C_MASK, USB1_USBSTS);
 	}
 }

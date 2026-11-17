@@ -41,7 +41,7 @@ OBJS := $(BUILD)/start.o \
 	$(BUILD)/drivers/usb/usb_ch9.o \
 	$(BUILD)/drivers/usb/usbd_soc.o \
 	$(BUILD)/drivers/usb/usbd.o \
-	$(BUILD)/drivers/usb/usb_dl.o \
+	$(BUILD)/drivers/usb/download.o \
 	$(BUILD)/lib/crc32.o \
 	$(BUILD)/lib/math.o \
 	$(BUILD)/lib/printf.o
