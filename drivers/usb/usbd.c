@@ -606,14 +606,18 @@ void usbd_download_mode(void)
 
 	usb_ch9_init();		/* ascii 名字 -> UTF-16 描述符（漏调则字符串全为 0 长） */
 
+	/* 定序（2026-11-19）：介质先探完，USB 最后才举手（RS=1 拉高 D+）。
+	 * eMMC 探测含 CMD1 轮询 + EXT_CSD 读，耗时几百 ms——主机在 D+
+	 * 上拉出现前看不到设备，不存在枚举窗口被吃掉的竞争。从主机看到
+	 * 设备的那一刻起，我们就已全就绪，首个总线复位即被轮询循环处理 */
+	download_media_init();
+
 	if (usbd_hw_init()) {
 		printf("usbd: init failed, halt\n");
 		for (;;)
 			;
 	}
 	printf("usbd: waiting for host (plug OTG port)...\n");
-
-	download_media_init();			/* 识别并初始化烧写目标介质 */
 
 	/* 轮询主循环：永不返回。EP0=USB 枚举，EP1=JBDL 烧录协议 */
 	for (;;) {

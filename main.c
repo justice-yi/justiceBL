@@ -35,6 +35,34 @@ static void halt_with_msg(const char *msg)
 	}
 }
 
+/* ---------- 异常处理器（start.S 向量表跳入，非编排代码） ----------
+ * 有声死替代无声死：出错指令地址 + 出错访问地址 + 故障类型全打出来
+ * 再挂死。DFSR/IFSR 编码见 ARMv7 ARM B4.9.10（对齐/权限/外部/翻译 等） */
+
+void data_abort_dump(u32 pc, u32 spsr, u32 dfar, u32 dfsr)
+{
+	printf("\n*** DATA ABORT ***\n");
+	printf("  PC   = 0x%08x  (出错指令地址)\n", pc);
+	printf("  DFAR = 0x%08x  (出错访问的地址)\n", dfar);
+	printf("  DFSR = 0x%08x  (故障类型编码)\n", dfsr);
+	printf("  SPSR = 0x%08x  (处理器状态)\n", spsr);
+	printf("******************\n");
+	for (;;)
+		;
+}
+
+void prefetch_abort_dump(u32 pc, u32 spsr, u32 ifar, u32 ifsr)
+{
+	printf("\n*** PREFETCH ABORT ***\n");
+	printf("  PC   = 0x%08x  (取指失败地址)\n", pc);
+	printf("  IFAR = 0x%08x  (取指访问的地址)\n", ifar);
+	printf("  IFSR = 0x%08x  (故障类型编码)\n", ifsr);
+	printf("  SPSR = 0x%08x  (处理器状态)\n", spsr);
+	printf("**********************\n");
+	for (;;)
+		;
+}
+
 int main(void)
 {
 	const struct block_source *src;

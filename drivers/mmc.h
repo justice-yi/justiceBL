@@ -9,7 +9,9 @@
 
 #include <types.h>
 
-/** 卡实例：sd_init()/emmc_init() 填充，之后用于块读取 */
+/** 卡实例：sd_init()/emmc_init() 填充，之后用于块读取。
+ * CID/详情字段位段解码规则逐条对拍 kernel drivers/mmc/core/{sd,mmc}.c
+ * （mmc_decode_cid；数组方向已适配：raw[0]=最高字，内核宏按 resp[3] 最高） */
 struct mmc_card {
 	u32 base;		/**< USDHC 基址（模块私有，调用者只当句柄用 */
 	u32 rca;		/**< 卡相对地址（识别流程分配） */
@@ -18,7 +20,24 @@ struct mmc_card {
 	u32 csd_raw[4];		/**< CSD 原始位（R2 响应经 r2_deshift 去硬件
 				  * 8 位偏移后的规范布局，调试/容量解析用） */
 	u32 blocks;		/**< 用户区容量（512B 块数；0 = 未知） */
+	u32 cid_raw[4];		/**< CID 原始位（CMD2 响应去移位后，规范布局） */
+	/* SD 专属（CSD/SCR 解码，init 时一次填好） */
+	u8 tran_speed_mhz;	/**< CSD.TRAN_SPEED 换算（0x32→25、0x5A→50） */
+	u8 sd_spec;		/**< SCR.SD_SPEC：0=1.0/1.01 1=1.10 2=2.0/3.0 */
+	u8 sd_spec3;		/**< SCR bit47：SD_SPEC=2 时 1=3.0 */
+	u8 bus_width_4;		/**< SCR.SD_BUS_WIDTHS bit1（4 位支持） */
+	/* eMMC 专属（EXT_CSD 摘录，CMD8 时一次填好） */
+	u8 ext_rev;		/**< EXT_CSD[192]：0=4.0…6=5.1 */
+	u8 pre_eol;		/**< EXT_CSD[267]：1=Normal 2=Warning 3=Urgent */
+	u8 life_a;		/**< EXT_CSD[268]：1..10 档（10%/档），11=超期 */
+	u8 life_b;		/**< EXT_CSD[269]：同上（B 分区） */
+	u32 cache_kb;		/**< EXT_CSD[249..252]（KB） */
+	u32 boot_mult;		/**< EXT_CSD[226]（单位 128KB，双 boot 分区共享） */
+	u8 cache_ctrl;		/**< 1 = 写缓存已启用（CMD6 写 EXT_CSD[33]=1） */
 };
+
+/** 卡身份/健康详情 → 单行文本（INFO 的 media detail 行；buf 建议≥160B） */
+void mmc_card_detail(const struct mmc_card *card, char *buf, u32 size);
 
 int sd_init(struct mmc_card *card);
 int emmc_init(struct mmc_card *card);

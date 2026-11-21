@@ -20,16 +20,25 @@
  *                     crc(预留) | seq | rsv[2] }
  * 命令（host -> device）：
  *   PING(1)   心跳；应答头 status=0x4F
- *   INFO(2)   应答头(count=载荷字节数) + 信息字符串（介质/容量/协议版本）
+ *   INFO(2)   应答头(count=载荷字节数) + 多行文本：
+ *             boot=<启动介质名> 与 media<N>=<名> present=<0/1> cap=<块数>
+ *             （两介质在线探测一次拿全，容量单位 512B 块）
  *   READ(3)   lba/count -> 应答头(status=0) + count*512B 分块 IN
  *   WRITE(4)  lba/count -> 应答头(status=0 收数准备) + host 分块 OUT，
  *             全部收完 -> WRITE_DONE 应答头（status 非 0 = 写错）
+ *   SELECT(6) count=0/1 切烧写目标介质 -> 应答头(status=0)
+ *             默认 0=启动介质；切到不在位的介质回 status=ERR。
+ *             整卡烧录（flashtool 恢复页）用它指 SD 或 eMMC；
+ *             老工具不发此命令，行为不变（向后兼容，版本号不动）
  * 负载分块 16KB/次（dTD 上限 16K）；头里 crc 字段 v1 预留（USB 包级
  * CRC16 已保真，端到端校验由 host 烧后 READ 回读比对）。
  */
 
 #include <types.h>
+#include <stddef.h>
 #include <printf.h>
+#include <timer.h>
+#include <math.h>
 #include <usb_config.h>
 #include <blocksrc.h>
 #include <bootdev.h>
@@ -39,7 +48,7 @@
 #define JBDL_MAGIC	0x4C44424AU	/* "JBDL" 小端 */
 #define JBDL_VER	1
 enum { JBDL_PING = 1, JBDL_INFO = 2, JBDL_READ = 3, JBDL_WRITE = 4,
-       JBDL_WRITE_DONE = 5 };
+       JBDL_WRITE_DONE = 5, JBDL_SELECT = 6, JBDL_FLUSH = 7 };
 #define JBDL_HDR_LEN	32
 #define JBDL_CHUNK	(16 * 1024)
 #define JBDL_CHUNK_BLOCKS	(JBDL_CHUNK / 512)
@@ -58,9 +67,24 @@ struct jbdl_hdr {
 	u32	rsv[2];
 } __attribute__((packed));
 
-static const struct block_source *src;		/* 烧写目标 = 启动介质 */
+static const struct block_source *src;		/* 当前烧写目标（SELECT 可切） */
+static int media_ready;			/* 0=待探测（lazy），1=已探测 */
+
+/* 双介质槽：0=启动介质（拨码决定 SD/eMMC），1=另一张。INFO 报全表，
+ * SELECT 切换；块源实例来自 blocksrc.h（sd_source/emmc_source） */
+struct media_slot {
+	const struct block_source *source;
+	int present;				/* init 成功 = 在位 */
+	u32 blocks;				/* 在位时的容量（512B 块） */
+	char detail[160];			/* 身份/健康单行（block_source
+						 * .detail；不在位时留空） */
+};
+static struct media_slot media[2];
+static const char *boot_media_name;		/* 启动介质名（INFO 首行） */
 static u8 hdr_buf[JBDL_HDR_LEN] __attribute__((aligned(32)));
-static u8 chunk[2][JBDL_CHUNK] __attribute__((aligned(32)));	/* ★乒乓双桶 */
+/* ★乒乓双桶——DDR 大数据区（32K 挤爆 OCRAM 64K 的元凶，2026-11-19 下沉；
+ * DDR 由 DCD 在 ROM 阶段初始化，与 U-Boot 落点同块活内存） */
+static u8 chunk[2][JBDL_CHUNK] __attribute__((aligned(32), section(".ddr_bss")));
 static struct usb_xfer hdr_xfer;		/* ST_HDR 在途接收 */
 static struct usb_xfer rx_xfer;			/* ST_WDATA 在途接收 */
 static u8 rx_slot;				/* 在途接收落在哪个桶 */
@@ -69,6 +93,24 @@ enum download_state { ST_HDR, ST_WDATA };
 static enum download_state state;
 static u32 cur_lba, blocks_left;		/* WRITE 进行中的游标 */
 static u32 werr;				/* WRITE 过程中的错误码 */
+
+/* ---- 分段耗时统计（无干扰版）：timer_counter 计时存内存，
+ * 事务收尾一次性输出（传输期间零 UART 占用）。每事务采样前 16 chunk ---- */
+#define DIAG_N			16
+static u32 diag_rx_us[DIAG_N];		/* WRITE：USB 接收耗时 */
+static u32 diag_mmc_us[DIAG_N];		/* WRITE：eMMC 写（PIO+命令）耗时 */
+static u32 diag_n;			/* 已采样数 */
+static u64 diag_t_arm;			/* chunk 武装时刻 */
+static u32 diag_rm_us[DIAG_N];		/* READ：eMMC 读耗时 */
+static u32 diag_ru_us[DIAG_N];		/* READ：USB 发送等待耗时 */
+static u32 diag_rn;			/* READ 已采样数 */
+
+/* ticks → µs。诊断窗口短（<1s），差值截 u32 后走 udiv32
+ * （裸机无 libgcc，u64/u32 除法会拉 __aeabi_uidiv） */
+static u32 diag_us(u64 from, u64 to)
+{
+	return udiv32((u32)(to - from), timer_freq_hz() / 1000000U);
+}
 
 /* 发送超时（忙等圈数 ~15s 量级）：主机读走或总线复位二选一，
  * 都没有（主机进程被杀且未触发 reset）就放弃，防永久空转 */
@@ -164,13 +206,23 @@ static void download_handle_command(const u8 *raw)
 		break;
 
 	case JBDL_INFO: {
-		static char info[112];
+		static char info[512];
 		u32 ilen;
-		u32 cap = (src && src->blocks) ? src->blocks() : 0;
 
 		ilen = (u32)snprintf(info, sizeof(info),
-				     "justiceBL dl v%d media=%s cap=%u blocks",
-				     JBDL_VER, src ? src->name : "none", cap);
+				     "justiceBL dl v%d boot=%s\n"
+				     "media0=%s present=%d cap=%u\n"
+				     "media0.detail=%s\n"
+				     "media1=%s present=%d cap=%u\n"
+				     "media1.detail=%s",
+				     JBDL_VER,
+				     boot_media_name ? boot_media_name : "none",
+				     media[0].source ? media[0].source->name : "none",
+				     media[0].present, media[0].blocks,
+				     media[0].present ? media[0].detail : "-",
+				     media[1].source ? media[1].source->name : "none",
+				     media[1].present, media[1].blocks,
+				     media[1].present ? media[1].detail : "-");
 		if (ilen >= sizeof(info))
 			ilen = sizeof(info) - 1;	/* 截断钳位：防越界读 */
 		download_build_header(hdr_buf, JBDL_INFO, JBDL_ST_OK, 0, ilen);
@@ -179,6 +231,37 @@ static void download_handle_command(const u8 *raw)
 		download_send(info, ilen);
 		break;
 	}
+
+	case JBDL_SELECT:
+		/* 整卡烧录选目标：count=0/1。只允许切到在位介质——
+		 * 切了空卡槽，后续 WRITE 全部越界拒烧，不如当场报错 */
+		if (h.count < 2 && media[h.count].present) {
+			src = media[h.count].source;
+			download_build_header(hdr_buf, JBDL_SELECT,
+					      JBDL_ST_OK, 0, h.count);
+		} else {
+			download_build_header(hdr_buf, JBDL_SELECT,
+					      JBDL_ST_ERR, 0, h.count);
+		}
+		download_send(hdr_buf, JBDL_HDR_LEN);
+		break;
+
+	case JBDL_FLUSH:
+		/* 任务级缓存落盘：烧录任务收尾时主机显式发一次。
+		 * count=0：flush 当前所选介质 */
+		if (src && src->flush) {
+			if (src->flush())
+				download_build_header(hdr_buf, JBDL_FLUSH,
+						      JBDL_ST_ERR, 0, 0);
+			else
+				download_build_header(hdr_buf, JBDL_FLUSH,
+						      JBDL_ST_OK, 0, 0);
+		} else {
+			download_build_header(hdr_buf, JBDL_FLUSH,
+					      JBDL_ST_OK, 0, 0);
+		}
+		download_send(hdr_buf, JBDL_HDR_LEN);
+		break;
 
 	case JBDL_READ: {
 		/* 流水线：CPU 读 chunk[i^1]（SD 慢）与 USB 发 chunk[i] 重叠。
@@ -197,6 +280,7 @@ static void download_handle_command(const u8 *raw)
 				      h.lba, h.count);
 		if (download_send(hdr_buf, JBDL_HDR_LEN))
 			return;
+		diag_rn = 0;			/* 新 READ 事务：采样窗口重开 */
 
 		/* 首块：读 + 提交 */
 		n = h.count;
@@ -215,12 +299,15 @@ static void download_handle_command(const u8 *raw)
 		slot = 1;
 
 		while (done < h.count) {
+			u64 t_mmc0, t_usb0;
+
 			if (download_link_changed())
 				return;
 			n = h.count - done;
 			if (n > JBDL_CHUNK_BLOCKS)
 				n = JBDL_CHUNK_BLOCKS;
 			/* ① CPU 读下一块（USB 正在发上一块——重叠） */
+			t_mmc0 = timer_counter();
 			if (src->read(h.lba + done, n, chunk[slot], 0)) {
 				printf("download: media read fail @lba%u, abort stream\n",
 				       h.lba + done);
@@ -228,8 +315,17 @@ static void download_handle_command(const u8 *raw)
 				return;
 			}
 			/* ② 等上一块发完 */
+			t_usb0 = timer_counter();
 			if (!download_tx_drain(&tx))
 				return;
+			/* 采样（每 READ 事务前 16 chunk） */
+			if (diag_rn < DIAG_N) {
+				diag_rm_us[diag_rn] = diag_us(t_mmc0,
+							      t_usb0);
+				diag_ru_us[diag_rn] = diag_us(t_usb0,
+							      timer_counter());
+				diag_rn++;
+			}
 			/* ③ 提交本块 */
 			tx.buf = chunk[slot];
 			tx.len = n * 512;
@@ -239,6 +335,8 @@ static void download_handle_command(const u8 *raw)
 			slot ^= 1;
 		}
 		download_tx_drain(&tx);		/* 尾：等最后一块发完 */
+		/* 事务收尾：一次性输出采样 */
+
 		break;
 	}
 
@@ -257,6 +355,7 @@ static void download_handle_command(const u8 *raw)
 		blocks_left = h.count;
 		werr = 0;
 		rx_slot = 0;
+		diag_n = 0;			/* 新 WRITE 事务：采样窗口重开 */
 		if (!blocks_left) {		/* 空写：ack 后立即 DONE */
 			download_build_header(hdr_buf, JBDL_WRITE_DONE,
 					      JBDL_ST_OK, h.lba, 0);
@@ -273,17 +372,67 @@ static void download_handle_command(const u8 *raw)
 	state = ST_HDR;
 }
 
+/* 探测一个介质：init 成功 = 在位并记容量。失败打一行返回码（哪步死
+ * 的看 emmc_init/sd_init 内部打印——静默吞错是无声失败剧本，eMMC 首板
+ * 探测 2026-11-18 实证：只报 absent 无从下手） */
+static void media_probe(struct media_slot *slot,
+			const struct block_source *source, const char *tag)
+{
+	int ret;
+
+	slot->source = source;
+	slot->present = 0;
+	slot->blocks = 0;
+	slot->detail[0] = 0;
+	if (!source || !source->init)
+		return;
+	ret = source->init();
+	printf("download: %s init ret=%d\n", tag, ret);	/* ★诊断 */
+	if (ret) {
+		printf("download: %s init fail ret=%d\n", tag, ret);
+		return;
+	}
+	slot->present = 1;
+	slot->blocks = source->blocks ? source->blocks() : 0;
+	printf("download: %s probe ok, detail...\n", tag);	/* ★诊断 */
+	if (source->detail) {
+		const char *d = source->detail();
+
+		printf("download: %s detail len=%u\n", tag,	/* ★诊断 */
+		       (u32)sizeof(slot->detail));
+		for (u32 i = 0; i + 1 < sizeof(slot->detail) && d[i]; i++)
+			slot->detail[i] = d[i];
+		slot->detail[sizeof(slot->detail) - 1] = 0;
+	}
+	printf("download: %s probe done\n", tag);			/* ★诊断 */
+}
+
 void download_media_init(void)
 {
-	src = boot_source_get();
-	if (src && src->init()) {
-		printf("download: media init failed (%s)\n", src->name);
-		src = 0;
-	}
+	const struct block_source *boot;
+	const struct block_source *other;
+
+	if (media_ready)
+		return;			/* 幂等：lazy 首次调用后不再重跑 */
+
+	boot = boot_source_get();
+	other = (boot == &sd_source) ? &emmc_source : &sd_source;
+
+	media_probe(&media[0], boot, "media0");
+	media_probe(&media[1], other, "media1");
+	boot_media_name = boot ? boot->name : "none";
+
+	/* 默认烧写目标 = 启动介质；不在位（异常）退而选在位的另一张 */
+	src = media[0].present ? media[0].source :
+	      (media[1].present ? media[1].source : NULL);
 	if (src && !src->write)
 		printf("download: media is read-only\n");
-	if (src)
-		printf("download: target media %s\n", src->name);
+	printf("download: media0 %s%s\n", boot_media_name,
+	       media[0].present ? "" : "(absent)");
+	printf("download: media1 %s%s\n", other->name,
+	       media[1].present ? "" : "(absent)");
+	printf("download: target media %s\n", src ? src->name : "none");
+	media_ready = 1;
 }
 
 void download_poll(void)
@@ -336,6 +485,7 @@ void download_poll(void)
 			rx_xfer.buf = chunk[rx_slot];
 			rx_xfer.len = want * 512;
 			usb_ep_queue(USB_BULK_EP, 0, &rx_xfer);
+			diag_t_arm = timer_counter();	/* USB 接收起点 */
 			break;
 		}
 		case 0:
@@ -350,6 +500,8 @@ void download_poll(void)
 			u8 filled = rx_slot;
 			u32 n = rx_xfer.actual;
 			u32 left;
+			u64 t_done = timer_counter();	/* USB 接收完成时刻 */
+			u64 t_mmc0;
 
 			if (rx_xfer.err) {
 				printf("download: OUT dTD err=0x%x\n",
@@ -369,10 +521,12 @@ void download_poll(void)
 				rx_xfer.buf = chunk[rx_slot];
 				rx_xfer.len = want * 512;
 				usb_ep_queue(USB_BULK_EP, 0, &rx_xfer);
+				diag_t_arm = timer_counter();	/* 下一块接收起点 */
 			}
 
+			t_mmc0 = timer_counter();	/* eMMC 写起点 */
 			if (!werr && src->write(cur_lba, n / 512,
-						chunk[filled], 0)) {
+					chunk[filled], 0)) {
 				printf("download: media write err lba=%u blocks=%u\n",
 				       cur_lba, n / 512);
 				werr = 2;
@@ -384,11 +538,32 @@ void download_poll(void)
 				blocks_left = 0;
 			}
 
+			/* 采样（每 WRITE 事务前 16 chunk） */
+			if (diag_n < DIAG_N) {
+				diag_rx_us[diag_n] = diag_us(diag_t_arm,
+							     t_done);
+				diag_mmc_us[diag_n] = diag_us(t_mmc0,
+							      timer_counter());
+				diag_n++;
+			}
+
 			if (!blocks_left) {
+				/* 事务收尾：一次性输出采样（主机在等
+				 * WRITE_DONE，此处 UART 阻塞无害） */
+				for (u32 i = 0; i < diag_n; i++) {
+					printf("download: chunk%u usb_rx=%uus "
+					       "mmc_write=%uus\n",
+					       i, diag_rx_us[i],
+					       diag_mmc_us[i]);
+				}
 				/* 清场：作废可能在途的接收（正常收尾无在途，
 				 * flush 无害；写失败路径必须作废，否则残留
 				 * 完成位会被 ST_HDR 的头接收误读） */
 				usb_ep1_rx_abort();
+				/* flush 不在这里做（2026-11-20 教训：每条
+				 * WRITE 都 flush = 每次清缓存，加速效果全毁，
+				 * 还倒贴每次 ~1s 排空时间）。flush 移到任务级：
+				 * 主机收尾时发 JBDL_FLUSH(7) 显式触发一次 */
 				download_build_header(hdr_buf, JBDL_WRITE_DONE,
 						      werr ? JBDL_ST_ERR :
 							     JBDL_ST_OK,

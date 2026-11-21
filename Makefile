@@ -15,7 +15,8 @@ OBJCOPY := $(CROSS)objcopy
 OBJDUMP := $(CROSS)objdump
 
 CFLAGS  := -march=armv7-a -marm -ffreestanding -nostdlib -nostartfiles \
-	   -Wall -Wextra -O2 -g -fno-stack-protector -Iinclude -Idrivers \
+	   -Wall -Wextra -O2 -g -fno-stack-protector -mno-unaligned-access \
+	   -Iinclude -Idrivers \
 	   -DBUILD_HOST=\"$(shell hostname)\" -DBUILD_USER=\"$(shell whoami)\"
 # 开发调试：make SELFTEST=1 加入读回自检+二卡探测（生产路径不含）
 ifeq ($(SELFTEST),1)

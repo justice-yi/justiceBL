@@ -20,6 +20,11 @@
  * @write:	把 buf 的 nblocks 个 512B 块写到 lba；0 成功。
  *		NULL = 只读介质（如预留的串口下载通道）
  * @blocks:	用户区容量（512B 块数）；NULL = 未知
+ * @detail:	身份/健康详情单行文本（CID/EXT_CSD 解码，可空）。
+ *		在 init 成功后有效；静态缓冲，下次调用覆盖
+ * @flush:	把易失缓冲（如 eMMC 写缓存）强制落盘并等完成；0 成功。
+ *		NULL = 无易失缓冲。烧录事务收尾（WRITE_DONE 前）必须调用，
+ *		否则"完成"时数据可能仍在缓存未落 NAND
  */
 struct block_source {
 	const char *name;
@@ -29,6 +34,8 @@ struct block_source {
 	int (*write)(u32 lba, u32 nblocks, const void *buf,
 		     void (*progress)(u32 done, u32 total));
 	u32 (*blocks)(void);
+	const char *(*detail)(void);
+	int (*flush)(void);
 };
 
 /* 已注册的全部块源（索引即自检遍历顺序，bootdev.c 定义）*/

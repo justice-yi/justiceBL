@@ -18,8 +18,8 @@ _start:
 	b	reset			@ 0x00 复位：ROM/SDP 跳入的入口
 	b	hang			@ 0x04 未定义指令
 	b	hang			@ 0x08 软中断（svc）
-	b	hang			@ 0x0c 预取异常
-	b	hang			@ 0x10 数据异常
+	b	prefetch_abort		@ 0x0c 预取异常
+	b	data_abort		@ 0x10 数据异常（含对齐/权限/外部错误）
 	b	hang			@ 0x14 保留
 	b	hang			@ 0x18 IRQ
 	b	hang			@ 0x1c FIQ
@@ -44,6 +44,14 @@ reset:
 	bic	r0, r0, #(1 << 12)	@ I-cache
 	bic	r0, r0, #(1 << 2)	@ D-cache
 	bic	r0, r0, #(1 << 0)	@ MMU
+	bic	r0, r0, #(1 << 1)	@ ★SCTLR.A=0（显式清，防踩雷）：bit1 是
+				 @ 对齐检查使能（U-Boot system.h CR_A），置 1
+				 @ 会让任何未对齐访问触发 Data Abort——
+				 @ 2026-11-20 曾误当"SCTLR.U 允许不对齐"打开
+				 @ 它，直接导致 eMMC EXT_CSD 读挂死 + USB
+				 @ 枚举失败两案（树上 CR_A 实锤）。未对齐
+				 @ 防护由 Makefile -mno-unaligned-access
+				 @ 在编译器侧根治（不生成未对齐指令）
 	mcr	p15, 0, r0, c1, c0, 0
 	mov	r0, #0
 	mcr	p15, 0, r0, c7, c5, 0	@ 使整个 I-cache 失效（关≠空）
@@ -79,4 +87,31 @@ reset:
 
 hang:
 	wfi
+	b	hang
+
+/* ---------- 异常处理器：打印诊断后挂死（无声死→有声死） ----------
+ * 模式切换序（ARMv7 异常模型）：
+ *   入口处于 ABT 模式（LR/SPSR 为 banked 寄存器），SP_abt 未初始化
+ *   → 先用共享寄存器 r0-r3 抢救现场（ fault PC、SPSR、DFAR/DFSR ）
+ *   → cps 切回 SVC 模式（栈可用）→ push lr_svc → bl C 函数打印 → 挂死
+ * offset 修正：Data Abort 的 LR = 出错 PC + 8；Prefetch = +4（ARMv7 ARM B1.8.3） */
+
+data_abort:
+	sub	r0, lr, #8			@ r0 = 出错指令地址
+	mrs	r1, spsr			@ r1 = CPSR（出错时的处理器状态）
+	mrc	p15, 0, r2, c6, c0, 0		@ r2 = DFAR（出错访问的地址）
+	mrc	p15, 0, r3, c5, c0, 0		@ r3 = DFSR（故障类型编码）
+	cps	#0x13				@ 切回 SVC 模式（正常栈可用）
+	push	{lr}
+	bl	data_abort_dump
+	b	hang				@ C 函数不返回也兜底
+
+prefetch_abort:
+	sub	r0, lr, #4			@ r0 = 取指失败地址
+	mrs	r1, spsr			@ r1 = CPSR
+	mrc	p15, 0, r2, c6, c0, 2		@ r2 = IFAR（取指失败地址）
+	mrc	p15, 0, r3, c5, c0, 1		@ r3 = IFSR（故障类型）
+	cps	#0x13
+	push	{lr}
+	bl	prefetch_abort_dump
 	b	hang
